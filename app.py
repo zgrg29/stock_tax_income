@@ -51,7 +51,7 @@ all_transactions = []
 seen_stake_identifiers = set()
 
 # ==========================================
-# 核心数据处理逻辑（用 if 包裹，避免一开局就跑空数据报错）
+# 核心数据处理逻辑
 # ==========================================
 if run_analysis:
     if not nabtrade_file and not stake_files:
@@ -64,7 +64,10 @@ if run_analysis:
                 # 国内交易
                 try:
                     df_dom = pd.read_excel(nabtrade_file, sheet_name='Domestic Portfolio Transactions', skiprows=1)
+                    # 🌟 强力清洗：防止 Streamlit 流数据读取时产生的伪空行
+                    df_dom = df_dom.replace(r'^\s*$', np.nan, regex=True)
                     df_dom = df_dom.dropna(subset=['Date', 'Code', 'Movement Type'])
+                    
                     for _, row in df_dom.iterrows():
                         tx_type = str(row['Movement Type']).upper().strip()
                         if 'TRANSFER' in tx_type:
@@ -85,7 +88,10 @@ if run_analysis:
                 # 国际交易
                 try:
                     df_int = pd.read_excel(nabtrade_file, sheet_name='Int.  Portfolio Transactions', skiprows=1)
+                    # 🌟 强力清洗
+                    df_int = df_int.replace(r'^\s*$', np.nan, regex=True)
                     df_int = df_int.dropna(subset=['Date', 'Code', 'Movement Type'])
+                    
                     for _, row in df_int.iterrows():
                         tx_type = str(row['Movement Type']).upper().strip()
                         if 'TRANSFER' in tx_type:
@@ -114,6 +120,8 @@ if run_analysis:
                                 continue
                             
                             df_stake.columns = df_stake.columns.str.strip()
+                            # 🌟 强力清洗：将 Streamlit 上传文件中可能存在的“不可见空格行”强制转成 NaN
+                            df_stake = df_stake.replace(r'^\s*$', np.nan, regex=True)
                             df_stake = df_stake.dropna(subset=['Trade Date', 'Symbol', 'Side'])
                             
                             s_count = 0
@@ -124,7 +132,7 @@ if run_analysis:
                                     continue
                                 
                                 trade_id = str(row.get('Trade Identifier', '')).strip()
-                                if not trade_id:
+                                if not trade_id or trade_id == 'nan':
                                     trade_id = f"{row['Trade Date']}_{row['Symbol']}_{tx_type}_{row['Units']}_{row['Avg. Price']}"
                                 
                                 if trade_id in seen_stake_identifiers:
@@ -132,10 +140,11 @@ if run_analysis:
                                     continue
                                 
                                 seen_stake_identifiers.add(trade_id)
+                                ticker_clean = str(row['Symbol']).strip().split()[0]
                                 
                                 all_transactions.append({
                                     'Date': pd.to_datetime(row['Trade Date']).tz_localize(None),
-                                    'Ticker': str(row['Symbol']).strip(),
+                                    'Ticker': ticker_clean,
                                     'Type': tx_type,
                                     'Quantity': float(abs(row['Units'])),
                                     'Price': float(row['Avg. Price']),
@@ -143,13 +152,12 @@ if run_analysis:
                                     'Source': f'Stake_{sheet.split()[0]}'
                                 })
                                 s_count += 1
-                        except:
+                        except Exception as e:
                             pass
 
             # --- 3. 运行 FIFO 清算引擎 ---
-            # 🌟 核心修复：在这里做双重防御，确保列表不为空且转成的 DataFrame 有 'Date' 列
             if not all_transactions:
-                st.error("❌ 未能在您上传的所有 Excel 中解析到合规的 BUY/SELL 交易。")
+                st.error("❌ 未能在您上传的所有 Excel 中解析到任何有效的 BUY/SELL 交易。请检查上传文件的内容及标签页。")
             else:
                 df_all = pd.DataFrame(all_transactions)
                 
@@ -159,9 +167,12 @@ if run_analysis:
                     # 严格按全局时间线升序排列
                     df_all = df_all.sort_values('Date').reset_index(drop=True)
                     
-                    # 规范化动作名称
-                    type_map = {'BUY': 'BUY', 'B': 'BUY', 'SELL': 'SELL', 'S': 'SELL', 'RETURN OF CAPITAL': 'RETURN_OF_CAPITAL', 'ROC': 'RETURN_OF_CAPITAL'}
-                    df_all['Type'] = df_all['Type'].map(type_map).fillna(df_all['Type'])
+                    type_map = {
+                        'BUY': 'BUY', 'B': 'BUY', 
+                        'SELL': 'SELL', 'S': 'SELL', 
+                        'RETURN OF CAPITAL': 'RETURN_OF_CAPITAL', 'ROC': 'RETURN_OF_CAPITAL'
+                    }
+                    df_all['Type'] = df_all['Type'].astype(str).str.upper().str.strip().map(type_map).fillna(df_all['Type'])
                     
                     portfolio = {}
                     cgt_events = []
