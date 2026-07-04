@@ -255,38 +255,76 @@ if run_analysis:
                 else:
                     cgt_df = pd.DataFrame(cgt_events)
                     
-                    # 1. 计算各项核心指标
-                    short_term_total = cgt_df[cgt_df['Category'].str.contains('Held < 1 Year')]['Net Gain/Loss'].sum()
-                    long_term_total = cgt_df[cgt_df['Category'].str.contains('Held >= 1 Year')]['Net Gain/Loss'].sum()
-                    raw_net_result = short_term_total + long_term_total
+                    # 1. 严格拆分提取原始（Gross）长、短期独立盈亏项
+                    lt_mask = cgt_df['Category'].str.contains('Held >= 1 Year')
+                    st_mask = cgt_df['Category'].str.contains('Held < 1 Year')
                     
-                    all_gains = cgt_df[cgt_df['Net Gain/Loss'] > 0]['Net Gain/Loss'].sum()
-                    all_losses = abs(cgt_df[cgt_df['Net Gain/Loss'] < 0]['Net Gain/Loss'].sum())
+                    lt_gains = cgt_df[lt_mask & (cgt_df['Net Gain/Loss'] > 0)]['Net Gain/Loss'].sum()
+                    lt_losses = abs(cgt_df[lt_mask & (cgt_df['Net Gain/Loss'] < 0)]['Net Gain/Loss'].sum())
                     
-                    if raw_net_result <= 0:
-                        taxable_gain = 0.0
-                        carried_loss = abs(raw_net_result)
-                    else:
-                        carried_loss = 0.0
-                        net_long_term = max(0.0, long_term_total) if short_term_total >= 0 else max(0.0, long_term_total + short_term_total)
-                        net_short_term = max(0.0, short_term_total) if short_term_total >= 0 else 0.0
-                        taxable_gain = net_short_term + (net_long_term * 0.5)
+                    st_gains = cgt_df[st_mask & (cgt_df['Net Gain/Loss'] > 0)]['Net Gain/Loss'].sum()
+                    st_losses = abs(cgt_df[st_mask & (cgt_df['Net Gain/Loss'] < 0)]['Net Gain/Loss'].sum())
+                    
+                    # 汇总展示数据指标用
+                    short_term_total = st_gains - st_losses
+                    long_term_total = lt_gains - lt_losses
+                    all_gains = lt_gains + st_gains
+                    all_losses = lt_losses + st_losses
+                    raw_net_result = all_gains - all_losses
 
                     # ----------------------------------------------------
-                    # 【核心模块一】：ATO 最终报税申报结论（手机端置顶、显眼）
+                    # ATO 官方标准核心算法对冲状态机（修正亏损抵扣顺序错误）
+                    # ----------------------------------------------------
+                    total_losses_to_offset = all_losses
+                    
+                    # 步骤一：首先用总亏损去完美冲抵长期原始盈利（ATO 官方建议顺序，使减免最大化）
+                    if lt_gains >= total_losses_to_offset:
+                        net_lt_gain = lt_gains - total_losses_to_offset
+                        total_losses_to_offset = 0.0
+                    else:
+                        total_losses_to_offset -= lt_gains
+                        net_lt_gain = 0.0
+                        
+                    # 步骤二：若总亏损还没扣完，继续去冲抵短期原始盈利
+                    if total_losses_to_offset > 0:
+                        if st_gains >= total_losses_to_offset:
+                            net_st_gain = st_gains - total_losses_to_offset
+                            total_losses_to_offset = 0.0
+                        else:
+                            total_losses_to_offset -= st_gains
+                            net_st_gain = 0.0
+                    else:
+                        net_st_gain = st_gains
+
+                    # 步骤三：计算最终并入总收入的净资本利得（仅对冲后仍留存的长期收益应用 50% 折扣）
+                    if (net_lt_gain + net_st_gain) > 0:
+                        taxable_gain = net_st_gain + (net_lt_gain * 0.5)
+                        carried_loss = 0.0
+                    else:
+                        taxable_gain = 0.0
+                        carried_loss = total_losses_to_offset  # 如果最终全局还是负数，则作为净亏损永久结转
+
+                    # ----------------------------------------------------
+                    # 【核心模块一】：ATO 最终报税申报结论 & 最终计入总收入统计
                     # ----------------------------------------------------
                     st.subheader("📢 ATO 报税最终结论")
                     if taxable_gain > 0:
                         st.success(f"""
-                        **应填入税单 [Taxable Net Capital Gain] 处的总金额：**
+                        **1. 最终应填入税单中 [Taxable Net Capital Gain] 处的总金额（也是最终并入你个人总收入 Income 的股票净盈利）：**
                         ## **${taxable_gain:,.2f}**
                         
-                        *💡 注：已自动应用 50% Individual Discount 减免。该金额将直接并入当期个人总收入，按您的年度个人边际税率计税。*
+                        **2. 减免明细预览（50% Individual Discount 节省额）：**
+                        * 原始股票总净收益 (Gross Gain): `${raw_net_result:,.2f}`
+                        * 税务局政策帮您自动免征（免税）的金额: `${(raw_net_result - taxable_gain):,.2f}`
+                        
+                        *💡 该系统已帮您自动应用折减。上述高亮的倍数金额将作为【应纳税所得（Assessable Income）】直接并入您当期的个人综合总收入（包含工资、利息、海外收入等），并最终按您的年度个人边际税率（Marginal Tax Rate）计税。*
                         """)
                     else:
                         st.error(f"""
-                        **最终应计入税单的净资本利得：** ## **$0.00**
-                        **可结转至未来财年抵扣的净亏损 (Capital Loss Carried Forward)：** ## **${carried_loss:,.2f}**
+                        **1. 最终应计入本期税单总收入 (Total Income) 的股票净资本利得：** ## **$0.00**
+                        **2. 可永久结转至未来财年用于抵扣盈利的资本净亏损 (Capital Loss Carried Forward)：** ## **${carried_loss:,.2f}**
+                        
+                        *💡 注：在澳洲，股票净亏损不能用来抵扣当年的打工工资收入（Salary/Wages），只能锁死在税务账户中，永久结转用于抵扣未来年份的股票或房产等资本增值盈利。*
                         """)
 
                     # ----------------------------------------------------
