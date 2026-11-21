@@ -8,9 +8,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from cgt import CalculationError, summarize
-from importers import (BrokerImporter, load_rates, load_accounts, load_transfer_reviews,
-                       CONFIRMED, REVIEW, BLOCKED, INVALID)
+from stock_tax.cgt import CalculationError, summarize
+from stock_tax.importers import (BrokerImporter, load_rates, load_accounts, load_transfer_reviews,
+                                 CONFIRMED, REVIEW, BLOCKED, INVALID)
 
 
 def show_import_audit(importer, ledger):

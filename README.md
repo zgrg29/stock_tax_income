@@ -45,9 +45,22 @@ Date,Currency,AUD per unit
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -v
+.venv\Scripts\python.exe check_startup.py
 ```
 
 测试包括计算边界、Excel 内存样表导入、去重、币种换算及页面流程。尚未用使用者实际券商报表核对列名与金额单位。
+
+### 部署前启动检查
+
+业务实现在 `stock_tax/cgt.py` 和 `stock_tax/importers.py`，包内使用相对导入。`app.py` 只使用项目专用的 `stock_tax.*` 模块；根目录 `cgt.py` / `importers.py` 是同一实现的兼容导出，不维护第二套算法。这避免旧进程缓存或环境中的顶层同名模块使新版入口加载到旧接口。
+
+`check_startup.py` 校验依赖声明及实际安装、关键导入符号、模块实际来源和内部循环依赖，然后启动临时本机 Streamlit 服务。它不仅检查健康端点，还建立真实 WebSocket 会话执行 `app.py`，验证脚本完成、没有异常元素、首页标题、计算按钮及侧栏上传控件齐全。服务检查完成后自动关闭，不需要浏览器或用户的真实 Excel。
+
+GitHub Actions 的 `Startup and regression checks` 在 Push / PR 时使用 Ubuntu 和 Python 3.11、3.12、3.13 执行干净依赖安装、`pip check`、上述启动检查及全部回归测试。Streamlit Cloud 的实际 Python 版本仍由部署设置决定，不由此文件修改；应选择与已通过 CI 的版本一致的解释器。
+
+启动回归额外模拟上一版/同名 `cgt`、`importers` 已存在于 `sys.modules` 的情况，保证这些旧模块不能破坏新版初始化。仅凭隐藏后的 Cloud 错误无法证明线上故障一定由该缓存条件触发；排查中确认本地和远程 `777b47a` 均包含新增符号，且复现了旧模块残留时 `load_accounts` 导入失败。
+
+Push 后请确认 GitHub Actions 对应提交为绿色，再刷新 Cloud 应用。若仍显示原错误，检查 Cloud 日志中的部署提交/解释器并执行 Reboot；不要将 GitHub Push 或本地健康检查当作线上验收结果。本轮不依赖浏览器或线上账号，无法据此声明线上页面已实际恢复。
 
 规则参考：[ATO 资本亏损抵扣](https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax/calculating-your-cgt/using-capital-losses-to-reduce-capital-gains)、[ATO CGT 折扣](https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax/calculating-your-cgt/cgt-discount)。
 
