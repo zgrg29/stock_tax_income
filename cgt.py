@@ -1,6 +1,6 @@
 """FIFO capital gains, with all amounts denominated in AUD."""
-from collections import defaultdict, deque
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -54,6 +54,8 @@ class Transaction:
     fees: Decimal = ZERO
     source: str = ''
     reference: str = ''
+    account: str = ''
+    record_id: str = ''
 
     def __post_init__(self):
         object.__setattr__(self, 'date', trade_date(self.date))
@@ -77,6 +79,42 @@ class Lot:
     quantity: Decimal
     unit_cost: Decimal
     source: str
+    account: str = ''
+    record_id: str = ''
+    transfers: tuple = ()
+    adjustments: tuple = ()
+
+
+@dataclass(frozen=True)
+class Transfer:
+    """A reconciled pair of custody legs, with ownership evidence checked upstream."""
+    transfer_id: str
+    market: str
+    ticker: str
+    quantity: Decimal
+    out_date: date
+    in_date: date
+    from_account: str
+    to_account: str
+    record_ids: tuple
+
+    def __post_init__(self):
+        object.__setattr__(self, 'quantity', number(self.quantity, '转仓数量', positive=True))
+        object.__setattr__(self, 'out_date', trade_date(self.out_date))
+        object.__setattr__(self, 'in_date', trade_date(self.in_date))
+        if self.in_date < self.out_date or not self.from_account or not self.to_account:
+            raise CalculationError('转仓日期或账户无效')
+        if self.from_account == self.to_account:
+            raise CalculationError('转仓来源和目标账户相同')
+
+
+@dataclass
+class Ledger:
+    events: list = field(default_factory=list)
+    lots: list = field(default_factory=list)
+    transfer_checks: dict = field(default_factory=dict)
+    errors: list = field(default_factory=list)
+    row_checks: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -91,51 +129,155 @@ class Event:
     buy_platform: str
     sell_platform: str
     kind: str = 'SELL'
+    buy_record_id: str = ''
+    sell_record_id: str = ''
+    transfer_chain: tuple = ()
+    cost_adjustments: tuple = ()
+
+
+def calculate_ledger(transactions, start_year, transfers=()):
+    """One FIFO engine for trades and verified custody movements.
+
+    Transfer assets require identified custody accounts. In-transit lots remain
+    owned but are unavailable for sale. Any error invalidates the final result.
+    """
+    start, end = date(start_year, 7, 1), date(start_year + 1, 7, 1)
+    transactions = list(transactions)
+    transfers = [t for t in transfers if t.out_date < end]
+    strict_assets = {(t.market, t.ticker) for t in transfers}
+    ledger = Ledger()
+    portfolio = defaultdict(list)
+    tainted = set()
+    timeline = [(t.date, 1, t) for t in transactions if t.date < end]
+    days = defaultdict(list)
+    for movement in transfers:
+        timeline.extend([(movement.out_date, 0, movement), (movement.in_date, 2, movement)])
+        for day in {movement.out_date, movement.in_date}:
+            days[day, movement.market, movement.ticker].append(movement.transfer_id)
+    ambiguous = {key for key, ids in days.items() if len(set(ids)) > 1}
+    for tx in transactions:
+        key = tx.date, tx.market, tx.ticker
+        if key in days:
+            ambiguous.add(key)
+    trade_days = defaultdict(list)
+    for tx in transactions:
+        trade_days[tx.date, tx.market, tx.ticker].append(tx)
+    for key, rows in trade_days.items():
+        costs = {r.price + r.fees / r.quantity for r in rows if r.action == 'BUY'}
+        if len({r.action for r in rows}) > 1 or len(costs) > 1:
+            ambiguous.add(key)
+
+    def snapshot(lots):
+        return [dict(buy_date=str(l.date), quantity=str(l.quantity), unit_cost=str(l.unit_cost),
+                     account=l.account, buy_record_id=l.record_id, transfers=list(l.transfers),
+                     cost_adjustments=list(l.adjustments))
+                for l in lots if l.quantity]
+
+    for day, phase, item in sorted(timeline, key=lambda entry: (entry[0], entry[1])):
+        if day >= end:
+            continue
+        key = item.market, item.ticker
+        lots = portfolio[key]
+        is_transfer = isinstance(item, Transfer)
+        check = ledger.transfer_checks.setdefault(item.transfer_id, {}) if is_transfer else None
+        if check is not None:
+            check['record_ids'] = list(item.record_ids)
+        elif item.record_id:
+            ledger.row_checks[item.record_id] = {'Status': '已验证'}
+        try:
+            if (day, *key) in ambiguous:
+                raise CalculationError(f'{day} {key}: 同日存在不同成本/类型或转仓及其他动作，缺少可靠日内顺序')
+            if key in tainted:
+                raise CalculationError(f'{day} {key}: 此证券此前数据错误，后续库存及成本无法验证')
+            if is_transfer:
+                transit = f'IN_TRANSIT:{item.transfer_id}'
+                account = item.from_account if phase == 0 else transit
+                eligible = sorted((l for l in lots if l.account == account and l.quantity), key=lambda l: l.date)
+                holding = sum((l.quantity for l in eligible), ZERO)
+                if holding < item.quantity:
+                    check['original_purchase'] = '缺失或数量不足'
+                    check['cost_complete'] = False
+                    raise CalculationError(f'{day} {key}: 转仓数量 {item.quantity} 超过来源账户已知持仓 {holding}；补齐原始买入/转仓记录')
+                before = snapshot(lots)
+                remaining = item.quantity
+                allocations = []
+                for lot in eligible:
+                    if not remaining:
+                        break
+                    matched = min(remaining, lot.quantity)
+                    moved = replace(lot, quantity=matched,
+                                    account=transit if phase == 0 else item.to_account,
+                                    transfers=lot.transfers + ((item.transfer_id,) if phase == 0 else ()))
+                    lots.append(moved)
+                    lot.quantity -= matched
+                    remaining -= matched
+                    allocations.extend(snapshot([moved]))
+                lots[:] = [l for l in lots if l.quantity]
+                check.update(original_purchase='存在', cost_complete=True)
+                check['out' if phase == 0 else 'in'] = dict(before=before, after=snapshot(lots), allocations=allocations)
+                continue
+            tx = item
+            context = f'{tx.source} {tx.reference} {day} {tx.market}:{tx.ticker}'
+            if day < date(1999, 9, 21):
+                raise CalculationError(f'{context}: 1999-09-21 以前的资产需单独处理指数化/豁免规则')
+            if key in strict_assets and not tx.account:
+                raise CalculationError(f'{context}: 转仓证券的交易缺少账户标识，不能猜测归属')
+            if tx.action == 'BUY':
+                lots.append(Lot(day, tx.quantity, tx.price + tx.fees / tx.quantity,
+                                tx.source, tx.account, tx.record_id))
+                continue
+            eligible = sorted((l for l in lots if l.quantity and
+                               (key not in strict_assets or l.account == tx.account)), key=lambda l: l.date)
+            holding = sum((l.quantity for l in eligible), ZERO)
+            if tx.action != 'RETURN_OF_CAPITAL' and holding < tx.quantity:
+                raise CalculationError(f'{context}: 缺失历史买入成本或账户库存不足，需 {tx.quantity} 股，库存仅 {holding} 股')
+            if tx.action == 'RETURN_OF_CAPITAL':
+                # A distribution applies to the owner's entire relevant holding,
+                # not just whichever account reported the corporate action.
+                eligible = [l for l in lots if l.quantity]
+                holding = sum((l.quantity for l in eligible), ZERO)
+                if holding != tx.quantity:
+                    raise CalculationError(f'{context}: 资本返还数量须与当日全部持仓 {holding} 一致')
+                for lot in eligible:
+                    excess = max(ZERO, tx.price - lot.unit_cost)
+                    lot.unit_cost = max(ZERO, lot.unit_cost - tx.price)
+                    lot.adjustments += (tx.record_id or f'{tx.source}:{tx.reference}:{day}',)
+                    if excess and start <= day < end:
+                        ledger.events.append(Event(*key, lot.date, day, lot.quantity, excess * lot.quantity,
+                                                   discount_eligible(lot.date, day), lot.source, tx.source,
+                                                   'RETURN_OF_CAPITAL', lot.record_id, tx.record_id, lot.transfers, lot.adjustments))
+                continue
+            remaining = tx.quantity
+            unit_proceeds = tx.price - tx.fees / tx.quantity
+            for lot in eligible:
+                if not remaining:
+                    break
+                matched = min(remaining, lot.quantity)
+                if start <= day < end:
+                    ledger.events.append(Event(*key, lot.date, day, matched,
+                                               (unit_proceeds - lot.unit_cost) * matched,
+                                               discount_eligible(lot.date, day), lot.source, tx.source,
+                                               'SELL', lot.record_id, tx.record_id, lot.transfers, lot.adjustments))
+                remaining -= matched
+                lot.quantity -= matched
+            lots[:] = [l for l in lots if l.quantity]
+        except CalculationError as exc:
+            ledger.errors.append(str(exc))
+            tainted.add(key)
+            if check is not None:
+                check['error'] = str(exc)
+            elif item.record_id:
+                ledger.row_checks[item.record_id] = {'Status': '计算受阻', 'Issue': str(exc)}
+    ledger.lots = [dict(market=key[0], ticker=key[1], verified=key not in tainted, **row)
+                   for key, lots in portfolio.items() for row in snapshot(lots)]
+    return ledger
 
 
 def calculate_events(transactions, start_year):
-    start, end = date(start_year, 7, 1), date(start_year + 1, 7, 1)
-    portfolio = defaultdict(deque)
-    events = []
-    for tx in sorted(transactions, key=lambda t: t.date):
-        if tx.date >= end:
-            continue
-        key = tx.market, tx.ticker
-        lots = portfolio[key]
-        context = f'{tx.source} {tx.reference} {tx.date} {tx.market}:{tx.ticker}'
-        if tx.date < date(1999, 9, 21):
-            raise CalculationError(f'{context}: 1999-09-21 以前的资产需单独处理指数化/豁免规则')
-        if tx.action == 'BUY':
-            lots.append(Lot(tx.date, tx.quantity, tx.price + tx.fees / tx.quantity, tx.source))
-            continue
-        holding = sum((lot.quantity for lot in lots), ZERO)
-        if holding < tx.quantity:
-            raise CalculationError(f'{context}: 缺失历史买入成本，需 {tx.quantity} 股，库存仅 {holding} 股')
-        if tx.action == 'RETURN_OF_CAPITAL':
-            if holding != tx.quantity:
-                raise CalculationError(f'{context}: 资本返还数量须与当日全部持仓 {holding} 一致')
-            for lot in lots:
-                excess = max(ZERO, tx.price - lot.unit_cost)
-                lot.unit_cost = max(ZERO, lot.unit_cost - tx.price)
-                if excess and start <= tx.date < end:
-                    events.append(Event(*key, lot.date, tx.date, lot.quantity,
-                                        excess * lot.quantity, discount_eligible(lot.date, tx.date),
-                                        lot.source, tx.source, 'RETURN_OF_CAPITAL'))
-            continue
-        remaining = tx.quantity
-        unit_proceeds = tx.price - tx.fees / tx.quantity
-        while remaining:
-            lot = lots[0]
-            matched = min(remaining, lot.quantity)
-            if start <= tx.date < end:
-                events.append(Event(*key, lot.date, tx.date, matched,
-                                    (unit_proceeds - lot.unit_cost) * matched,
-                                    discount_eligible(lot.date, tx.date), lot.source, tx.source))
-            remaining -= matched
-            lot.quantity -= matched
-            if not lot.quantity:
-                lots.popleft()
-    return events
+    ledger = calculate_ledger(transactions, start_year)
+    if ledger.errors:
+        raise CalculationError('\n'.join(ledger.errors))
+    return ledger.events
 
 
 def summarize(events, opening_loss=ZERO, discount_rate=Decimal('0.5')):
