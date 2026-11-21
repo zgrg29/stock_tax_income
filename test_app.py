@@ -52,6 +52,10 @@ def gains(at):
     return next(metric.value for metric in at.metric if metric.label == '本财年纯盈利项加总')
 
 
+def sales_table(at):
+    return next(table.value for table in at.dataframe if '处理结果' in table.value.columns)
+
+
 class PageTests(unittest.TestCase):
     def test_original_homepage_has_only_two_broker_uploads(self):
         at = AppTest.from_file(str(ROOT / 'app.py')).run(timeout=30)
@@ -122,12 +126,54 @@ class PageTests(unittest.TestCase):
         rows = [nab_row(), nab_row(side='TRANSFER OUT', day='2025-07-20', fee=0,
                                   **{'Beneficial Ownership Changed': 'YES'})]
         at = run_reports(workbook(rows, 'Nabtrade'), [workbook([stake_row()])], same_owner=True)
-        self.assertFalse(any('净资本利得' in x.value for x in at.success))
+        self.assertEqual(gains(at), '$190.00')
+        self.assertTrue(any('非最终报税金额' in x.value for x in at.subheader))
         self.assertTrue(any('受益所有权变化' in x.value for x in at.markdown))
 
     def test_prior_loss_offsets_gain_without_new_files(self):
         at = run_reports(workbook([nab_row()], 'Nabtrade'), [workbook([stake_row()])], opening_loss=50)
         self.assertTrue(any('**$140.00**' in x.value for x in at.success))
+
+    def test_partial_unmatched_sale_does_not_delete_entire_ticker_profit(self):
+        at = run_reports(workbook([nab_row()], 'Nabtrade'), [workbook([stake_row(qty=150)])])
+        self.assertEqual(gains(at), '$190.00')
+        table = sales_table(at)
+        self.assertEqual(len(table), 1)
+        self.assertEqual(table.iloc[0]['代码'], 'ABC')
+        self.assertEqual(table.iloc[0]['已匹配数量'], 100)
+        self.assertIn('部分匹配', table.iloc[0]['处理结果'])
+        self.assertTrue(any('非最终报税金额' in x.value for x in at.subheader))
+
+    def test_later_uncertain_action_does_not_hide_preceding_sale(self):
+        rows = [nab_row(), nab_row(day='2025-09-01', side='UNKNOWN ACTION', qty=0, fee=0)]
+        at = run_reports(workbook(rows, 'Nabtrade'), [workbook([stake_row()])])
+        self.assertEqual(gains(at), '$190.00')
+        self.assertIn('已匹配', sales_table(at).iloc[0]['处理结果'])
+
+    def test_sale_without_any_matched_cost_is_still_visible(self):
+        at = run_reports(stake=[workbook([stake_row(code='MISSING')])])
+        table = sales_table(at)
+        self.assertEqual(table.iloc[0]['代码'], 'MISSING')
+        self.assertIn('未匹配', table.iloc[0]['处理结果'])
+        self.assertTrue(pd.isna(table.iloc[0]['已匹配盈亏 AUD（待核对时非最终金额）']))
+
+    def test_fifo_costs_for_multiple_lots_are_visible(self):
+        at = run_reports(workbook([nab_row(day='2024-01-01'), nab_row(day='2024-02-01', price=20, qty=50, fee=5)], 'Nabtrade'),
+                         [workbook([stake_row(qty=120, price=30, fee=12)])])
+        batches = next(table.value for table in at.dataframe if 'Matched Cost Base AUD' in table.value.columns)
+        self.assertEqual(list(batches['Quantity']), [100, 20])
+        self.assertAlmostEqual(batches['Matched Cost Base AUD'].sum(), 1412)
+        self.assertAlmostEqual(batches['Matched Net Proceeds AUD'].sum(), 3588)
+        self.assertAlmostEqual(batches['Net Gain/Loss'].sum(), 2176)
+
+    def test_plain_sale_matches_original_fifo_profit(self):
+        at = run_reports(workbook([nab_row(fee=0)], 'Nabtrade'), [workbook([stake_row()])])
+        self.assertEqual(gains(at), '$200.00')
+
+    def test_original_long_term_discount_unchanged_without_losses(self):
+        at = run_reports(workbook([nab_row(day='2023-01-01', fee=0)], 'Nabtrade'), [workbook([stake_row()])])
+        self.assertEqual(gains(at), '$200.00')
+        self.assertTrue(any('**$100.00**' in x.value for x in at.success))
 
 
 if __name__ == '__main__':

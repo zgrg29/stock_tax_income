@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import re
 
 
 def fee_value(row, column):
@@ -13,6 +14,38 @@ def fee_value(row, column):
 def held_over_twelve_months(bought, sold):
     # Exclude acquisition and disposal dates; a year is not always 365 days.
     return sold.normalize() > bought.normalize() + pd.DateOffset(years=1)
+
+
+def transaction_type(value):
+    action = ' '.join(str(value).upper().split())
+    return {'B': 'BUY', 'PURCHASE': 'BUY', 'BOUGHT': 'BUY',
+            'S': 'SELL', 'SALE': 'SELL', 'SOLD': 'SELL'}.get(action, action)
+
+
+def security_code(value, market):
+    code = str(value).strip().upper()
+    prefixes = ('ASX:', 'AU:') if market == 'AU' else ('NASDAQ:', 'NYSE:', 'NYSEARCA:', 'US:')
+    suffixes = ('.AX', '.ASX', '.AU') if market == 'AU' else ('.US',)
+    for prefix in prefixes:
+        if code.startswith(prefix):
+            code = code[len(prefix):]
+            break
+    for suffix in suffixes:
+        if code.endswith(suffix):
+            code = code[:-len(suffix)]
+            break
+    return code
+
+
+def transaction_date(value, market='AU'):
+    # AU report strings use day/month/year; keep US month/day parsing and
+    # preserve Excel datetime cells and ISO dates without reinterpretation.
+    if pd.isna(value):
+        raise ValueError('交易日期为空')
+    if isinstance(value, (int, float, np.number)):
+        raise ValueError('交易日期是未解析的数字，请核对原表日期格式')
+    is_iso = isinstance(value, str) and re.match(r'^\d{4}-\d{2}-\d{2}', value.strip())
+    return pd.to_datetime(value, dayfirst=market == 'AU' and not bool(is_iso) if isinstance(value, str) else False).tz_localize(None)
 
 # ==========================================
 # Streamlit 页面基础配置
@@ -67,7 +100,8 @@ stake_files = st.sidebar.file_uploader(
 
 # 用来存放全局流水的列表和安全去重集合
 all_transactions = []
-seen_stake_identifiers = set()
+seen_stake_identifiers = {}
+sale_records = []
 transfer_records = []
 unresolved = []
 uncertain_assets = set()
@@ -106,7 +140,7 @@ def record_transfer(row, action, source, row_number, ticker, date_column, quanti
     if pd.isna(transfer_quantity) or not np.isfinite(transfer_quantity) or transfer_quantity == 0:
         transfer_records[-1]['处理'] += '；原表未提供有效转仓数量，未据此改变历史库存'
         return
-    all_transactions.append({'Date': pd.to_datetime(row[date_column]).tz_localize(None),
+    all_transactions.append({'Date': transaction_date(row[date_column], market),
                              'Ticker': ticker, 'Market': market, 'Type': 'TRANSFER_CHECK',
                              'Quantity': float(abs(transfer_quantity)), 'Price': 0.0,
                              'Fees': 0.0, 'Source': source})
@@ -115,12 +149,91 @@ def record_transfer(row, action, source, row_number, ticker, date_column, quanti
 def show_calculation_notes():
     notes = list(dict.fromkeys(parse_errors + unresolved))
     if notes:
-        st.warning(f'有 {len(notes)} 项记录需要核对；下面继续展示有完整成本记录的交易小计，不是最终报税金额。')
+        st.warning(f'有 {len(notes)} 项记录需要核对；下面保留已匹配买入批次的试算金额，未知部分不按零盈利处理，总额不是最终报税金额。')
         for note in notes[:3]:
             st.write(note)
         if len(notes) > 3:
             with st.expander('查看其余待核对记录'):
                 st.dataframe(pd.DataFrame({'需核对事项': notes[3:]}), hide_index=True, width='stretch')
+
+
+def capture_sales(frame, source, market, date_col, symbol_col, side_col, qty_col, price_col, first_row):
+    """Record raw sales BEFORE validation, currency checks, or FIFO matching."""
+    frame = frame.copy()
+    frame['_Sale ID'] = ''
+    if side_col not in frame:
+        return frame
+    for index, row in frame.iterrows():
+        if transaction_type(row[side_col]) != 'SELL':
+            continue
+        try:
+            date = transaction_date(row.get(date_col), market)
+        except (ValueError, TypeError):
+            date = pd.NaT
+        ticker = security_code(row.get(symbol_col, ''), market)
+        display_price = row.get(price_col, '')
+        display_currency = 'AUD' if market == 'AU' else str(row.get('Currency', '报表币种（未核实）'))
+        for aud_column in ('Average Price (AUD) *1', 'Avg. Price (AUD)'):
+            if not pd.isna(row.get(aud_column, np.nan)):
+                display_price, display_currency = row[aud_column], 'AUD'
+                break
+        record_id = f'sale-{len(sale_records) + 1}'
+        frame.at[index, '_Sale ID'] = record_id
+        sale_records.append({'Sale ID': record_id, '来源': source, 'Excel 行号': index + first_row,
+                             '券商交易编号': str(row.get('Trade Identifier', '')), '原始类型': str(row[side_col]),
+                             '市场': market, '代码': ticker, '原始日期': str(row.get(date_col, '')),
+                             '卖出日期': date, '卖出数量': str(row.get(qty_col, '')),
+                             '报表单价': str(display_price), '价格币种': display_currency,
+                             '处理结果': '未解析，待核对',
+                             '说明': '原始卖出行已保留；缺失日期/代码/方向等字段时不会进入FIFO',
+                             '已匹配数量': 0.0, '已匹配盈亏 AUD（待核对时非最终金额）': np.nan})
+        if (pd.isna(date) or date < fy_exclusive_end) and any(pd.isna(row.get(c)) for c in (date_col, symbol_col)):
+            parse_errors.append(f'{source} 第 {index + first_row} 行：卖出缺少日期或代码，原始行已保留待核对')
+    return frame
+
+
+def mark_sale(row, status, reason=''):
+    record_id = row.get('_Sale ID', row.get('Sale ID', ''))
+    for record in sale_records:
+        if record['Sale ID'] == record_id:
+            record['处理结果'], record['说明'] = status, reason
+            return
+
+
+def show_sales(events):
+    """Calculation eligibility never controls whether the original sale is visible."""
+    for record in sale_records:
+        date = record['卖出日期']
+        if not pd.isna(date) and not fy_start <= date < fy_exclusive_end:
+            record['处理结果'] = '财年外'
+            continue
+        matches = [event for event in events if event.get('Sale ID') == record['Sale ID']]
+        if not matches:
+            continue
+        matched = sum(event['Quantity'] for event in matches)
+        record['已匹配数量'] = matched
+        record['已匹配盈亏 AUD（待核对时非最终金额）'] = sum(event['Net Gain/Loss'] for event in matches)
+        raw_qty = pd.to_numeric(record['卖出数量'], errors='coerce')
+        if pd.isna(raw_qty) or not np.isclose(matched, abs(raw_qty), rtol=1e-10, atol=1e-12):
+            record['处理结果'] = '部分匹配，剩余成本缺失'
+        elif (record['市场'], record['代码']) in uncertain_assets:
+            record['处理结果'] = '已匹配，相关历史或成本待核对'
+        else:
+            record['处理结果'], record['说明'] = '已计算', '已按原版 FIFO 匹配历史买入'
+    current = [r for r in sale_records if pd.isna(r['卖出日期']) or fy_start <= r['卖出日期'] < fy_exclusive_end]
+    if sale_records:
+        st.subheader('📋 本财年全部卖出记录（含待核对）')
+        if current:
+            complete = sum(r['处理结果'] == '已计算' for r in current)
+            duplicate = sum(r['处理结果'] == '重复记录' for r in current)
+            st.caption(f'读取 {len(current)} 条卖出：已计算 {complete} 条，重复 {duplicate} 条，其余 {len(current) - complete - duplicate} 条待核对；日期缺失的记录也保留在表中。')
+            st.dataframe(pd.DataFrame(current), hide_index=True, width='stretch')
+        else:
+            st.info('已读取的卖出日期均不在所选财年；可展开下面的全部记录核对原始日期。')
+        with st.expander('查看全部卖出记录（含财年外）'):
+            st.dataframe(pd.DataFrame(sale_records), hide_index=True, width='stretch')
+        st.download_button('下载全部卖出记录 CSV（含未计算）', pd.DataFrame(sale_records).to_csv(index=False).encode('utf-8-sig'),
+                           file_name=f'all_sales_{TARGET_FY}.csv', mime='text/csv', on_click='ignore')
 
 # 开始处理按钮
 run_analysis = st.sidebar.button("🚀 开始融合账目并计算")
@@ -143,28 +256,40 @@ if run_analysis:
                 # 国内交易
                 try:
                     df_dom = pd.read_excel(nabtrade_file, sheet_name='Domestic Portfolio Transactions', skiprows=1)
+                    df_dom = capture_sales(df_dom, f'{nabtrade_file.name}/Domestic Portfolio Transactions', 'AU',
+                                           'Date', 'Code', 'Movement Type', 'Quantity', 'Transaction Price', 3)
                     df_dom = df_dom.dropna(subset=['Date', 'Code', 'Movement Type'])
                     for row_index, row in df_dom.iterrows():
-                        tx_type = str(row['Movement Type']).upper().strip()
-                        ticker = str(row['Code']).split('.')[0].strip().upper()
-                        if tx_type in transfer_types:
-                            record_transfer(row, tx_type, 'Nabtrade/Domestic Portfolio Transactions', row_index + 3, ticker, 'Date', 'Quantity')
-                            continue
-                        if 'TRANSFER' in tx_type:
+                        try:
+                            tx_type = transaction_type(row['Movement Type'])
+                            ticker = security_code(row['Code'], 'AU')
+                            date = transaction_date(row['Date'], 'AU')
+                            if date >= fy_exclusive_end:
+                                continue
+                            if tx_type in transfer_types:
+                                record_transfer(row, tx_type, 'Nabtrade/Domestic Portfolio Transactions', row_index + 3, ticker, 'Date', 'Quantity')
+                                continue
+                            if 'TRANSFER' in tx_type:
+                                uncertain_assets.add(('AU', ticker))
+                                unresolved.append(f'Nabtrade 第 {row_index + 3} 行 {ticker}: {tx_type} 不能确定为普通转仓')
+                                continue
+                            all_transactions.append({
+                                'Date': date,
+                                'Sale ID': row.get('_Sale ID', ''),
+                                'Ticker': ticker,
+                                'Market': 'AU',
+                                'Type': tx_type,
+                                'Quantity': float(abs(row['Quantity'])),
+                                'Price': float(row['Transaction Price']),
+                                'Fees': fee_value(row, 'Brokerage') + fee_value(row, 'Other Fees'),
+                                'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
+                                'Source': f'{nabtrade_file.name}/Domestic Portfolio Transactions 第 {row_index + 3} 行'
+                            })
+                            mark_sale(row, '已读入，等待 FIFO 计算')
+                        except Exception as exc:
+                            mark_sale(row, '解析失败，原始卖出行已保留', str(exc))
+                            parse_errors.append(f'{nabtrade_file.name}/Domestic Portfolio Transactions 第 {row_index + 3} 行' + f'：{exc}')
                             uncertain_assets.add(('AU', ticker))
-                            unresolved.append(f'Nabtrade 第 {row_index + 3} 行 {ticker}: {tx_type} 不能确定为普通转仓')
-                            continue
-                        all_transactions.append({
-                            'Date': pd.to_datetime(row['Date']).tz_localize(None),
-                            'Ticker': ticker,
-                            'Market': 'AU',
-                            'Type': tx_type,
-                            'Quantity': float(abs(row['Quantity'])),
-                            'Price': float(row['Transaction Price']),
-                            'Fees': fee_value(row, 'Brokerage') + fee_value(row, 'Other Fees'),
-                            'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
-                            'Source': 'Nabtrade_Domestic'
-                        })
                     st.success(f"✅ 成功载入原券商国内交易记录: {len(df_dom)} 条")
                 except Exception as e:
                     if 'Worksheet named' not in str(e):
@@ -177,32 +302,45 @@ if run_analysis:
                     if int_sheet is None:
                         raise ValueError('Worksheet named international not found')
                     df_int = pd.read_excel(nabtrade_file, sheet_name=int_sheet, skiprows=1)
+                    df_int = capture_sales(df_int, f'{nabtrade_file.name}/{int_sheet}', 'US',
+                                           'Date', 'Code', 'Movement Type', 'Quantity', 'Transaction Price (Exch CCY)', 3)
                     df_int = df_int.dropna(subset=['Date', 'Code', 'Movement Type'])
                     for row_index, row in df_int.iterrows():
-                        tx_type = str(row['Movement Type']).upper().strip()
-                        ticker = str(row['Code']).strip().upper()
-                        if tx_type in transfer_types:
-                            record_transfer(row, tx_type, f'Nabtrade/{int_sheet}', row_index + 3, ticker, 'Date', 'Quantity', market='US')
-                            continue
-                        if 'TRANSFER' in tx_type:
+                        try:
+                            tx_type = transaction_type(row['Movement Type'])
+                            ticker = security_code(row['Code'], 'US')
+                            date = transaction_date(row['Date'], 'US')
+                            if date >= fy_exclusive_end:
+                                continue
+                            if tx_type in transfer_types:
+                                record_transfer(row, tx_type, f'Nabtrade/{int_sheet}', row_index + 3, ticker, 'Date', 'Quantity', market='US')
+                                continue
+                            if 'TRANSFER' in tx_type:
+                                uncertain_assets.add(('US', ticker))
+                                unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 无法确认转仓类型')
+                                continue
+                            if tx_type in ['BUY', 'B', 'SELL', 'S'] and pd.isna(row.get('Average Price (AUD) *1', np.nan)):
+                                uncertain_assets.add(('US', ticker))
+                                unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 缺少 AUD 单价，未把外币当作澳元')
+                                mark_sale(row, '待换算 AUD，未计入澳元汇总', '原始卖出行已保留；缺少明确 AUD 单价')
+                                continue
+                            all_transactions.append({
+                                'Date': date,
+                                'Sale ID': row.get('_Sale ID', ''),
+                                'Ticker': ticker,
+                                'Market': 'US',
+                                'Type': tx_type,
+                                'Quantity': float(abs(row['Quantity'])),
+                                'Price': float(row.get('Average Price (AUD) *1', 0)),
+                                'Fees': fee_value(row, 'Brokerage (AUD)') + fee_value(row, 'Other Fees (AUD)'),
+                                'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
+                                'Source': f'{nabtrade_file.name}/{int_sheet} 第 {row_index + 3} 行'
+                            })
+                            mark_sale(row, '已读入，等待 FIFO 计算')
+                        except Exception as exc:
+                            mark_sale(row, '解析失败，原始卖出行已保留', str(exc))
+                            parse_errors.append(f'{nabtrade_file.name}/{int_sheet} 第 {row_index + 3} 行' + f'：{exc}')
                             uncertain_assets.add(('US', ticker))
-                            unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 无法确认转仓类型')
-                            continue
-                        if tx_type in ['BUY', 'B', 'SELL', 'S'] and pd.isna(row.get('Average Price (AUD) *1', np.nan)):
-                            uncertain_assets.add(('US', ticker))
-                            unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 缺少 AUD 单价，未把外币当作澳元')
-                            continue
-                        all_transactions.append({
-                            'Date': pd.to_datetime(row['Date']).tz_localize(None),
-                            'Ticker': ticker,
-                            'Market': 'US',
-                            'Type': tx_type,
-                            'Quantity': float(abs(row['Quantity'])),
-                            'Price': float(row.get('Average Price (AUD) *1', 0)),
-                            'Fees': fee_value(row, 'Brokerage (AUD)') + fee_value(row, 'Other Fees (AUD)'),
-                            'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
-                            'Source': 'Nabtrade_International'
-                        })
                     st.success(f"✅ 成功载入原券商国际交易记录: {len(df_int)} 条")
                 except Exception as e:
                     if 'Worksheet named' not in str(e):
@@ -211,7 +349,7 @@ if run_analysis:
             # --- 2. 解析多个 Stake 文件 ---
             if stake_files:
                 stake_sheets = ['Aus Equities', 'Wall St Equities']
-                for f_file in stake_files:
+                for file_number, f_file in enumerate(stake_files):
                     st.caption(f"🔍 发现符合条件的 Stake 文件: {f_file.name}")
                     for sheet in stake_sheets:
                         try:
@@ -220,67 +358,83 @@ if run_analysis:
                                 continue
 
                             df_stake.columns = df_stake.columns.str.strip()
+                            market = 'AU' if sheet == 'Aus Equities' else 'US'
+                            df_stake = capture_sales(df_stake, f'{f_file.name}/{sheet}', market,
+                                                     'Trade Date', 'Symbol', 'Side', 'Units', 'Avg. Price', 2)
                             df_stake = df_stake.dropna(subset=['Trade Date', 'Symbol', 'Side'])
 
                             s_count = 0
                             d_skipped = 0
                             occurrences = {}
                             for row_index, row in df_stake.iterrows():
-                                tx_type = str(row['Side']).upper().strip()
-                                ticker = str(row['Symbol']).strip().upper()
-                                market = 'AU' if sheet == 'Aus Equities' else 'US'
-                                if market == 'AU':
-                                    ticker = ticker.removesuffix('.AX')
-                                if tx_type in transfer_types:
-                                    record_transfer(row, tx_type, f'{f_file.name}/{sheet}', row_index + 2, ticker, 'Trade Date', 'Units', market=market)
-                                    continue
-                                if 'TRANSFER' in tx_type:
-                                    uncertain_assets.add((market, ticker))
-                                    unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 无法确认转仓类型')
-                                    continue
-                                if tx_type not in ['BUY', 'SELL', 'B', 'S']:
-                                    continue
-
-                                price = row['Avg. Price']
-                                fees = fee_value(row, 'Fees') + fee_value(row, 'GST')
-                                if market == 'US' and str(row.get('Currency', '')).strip().upper() != 'AUD':
-                                    price = row.get('Avg. Price (AUD)', np.nan)
-                                    if pd.isna(price) or (fees and pd.isna(row.get('Fees (AUD)', np.nan))):
-                                        uncertain_assets.add((market, ticker))
-                                        unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 缺少明确 AUD 价格/费用，未混算币种')
+                                try:
+                                    tx_type = transaction_type(row['Side'])
+                                    market = 'AU' if sheet == 'Aus Equities' else 'US'
+                                    ticker = security_code(row['Symbol'], market)
+                                    date = transaction_date(row['Trade Date'], market)
+                                    if date >= fy_exclusive_end:
                                         continue
-                                    fees = fee_value(row, 'Fees (AUD)') + fee_value(row, 'GST (AUD)')
+                                    if tx_type in transfer_types:
+                                        record_transfer(row, tx_type, f'{f_file.name}/{sheet}', row_index + 2, ticker, 'Trade Date', 'Units', market=market)
+                                        continue
+                                    if 'TRANSFER' in tx_type:
+                                        uncertain_assets.add((market, ticker))
+                                        unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 无法确认转仓类型')
+                                        continue
+                                    if tx_type not in ['BUY', 'SELL', 'B', 'S']:
+                                        continue
 
-                                # 精准安全去重标识
-                                raw_id = row.get('Trade Identifier', '')
-                                trade_id = '' if pd.isna(raw_id) else str(raw_id).strip()
-                                canonical_side = {'B': 'BUY', 'S': 'SELL'}.get(tx_type, tx_type)
-                                if not trade_id:
-                                    fingerprint = (str(pd.to_datetime(row['Trade Date'])), ticker, canonical_side,
-                                                   float(abs(row['Units'])), float(price), float(fees))
-                                    occurrences[fingerprint] = occurrences.get(fingerprint, 0) + 1
-                                    trade_id = ('no-id', fingerprint, occurrences[fingerprint])
-                                else:
-                                    trade_id = ('id', trade_id)
-                                trade_id = (sheet, str(row.get('Account Number', '')), trade_id)
+                                    price = row['Avg. Price']
+                                    fees = fee_value(row, 'Fees') + fee_value(row, 'GST')
+                                    if market == 'US' and str(row.get('Currency', '')).strip().upper() != 'AUD':
+                                        price = row.get('Avg. Price (AUD)', np.nan)
+                                        if pd.isna(price) or (fees and pd.isna(row.get('Fees (AUD)', np.nan))):
+                                            uncertain_assets.add((market, ticker))
+                                            unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 缺少明确 AUD 价格/费用，未混算币种')
+                                            mark_sale(row, '待换算 AUD，未计入澳元汇总', '原始卖出行已保留；原币价格/费用不可直接作为 AUD')
+                                            continue
+                                        fees = fee_value(row, 'Fees (AUD)') + fee_value(row, 'GST (AUD)')
 
-                                if trade_id in seen_stake_identifiers:
-                                    d_skipped += 1
-                                    continue
+                                    # 精准安全去重标识
+                                    raw_id = row.get('Trade Identifier', '')
+                                    trade_id = '' if pd.isna(raw_id) else str(raw_id).strip()
+                                    canonical_side = {'B': 'BUY', 'S': 'SELL'}.get(tx_type, tx_type)
+                                    if not trade_id:
+                                        fingerprint = (str(date), ticker, canonical_side,
+                                                       float(abs(row['Units'])), float(price), float(fees))
+                                        occurrences[fingerprint] = occurrences.get(fingerprint, 0) + 1
+                                        trade_id = ('no-id', fingerprint, occurrences[fingerprint])
+                                    else:
+                                        trade_id = ('id', trade_id)
+                                    trade_id = (sheet, str(row.get('Account Number', '')), trade_id)
 
-                                seen_stake_identifiers.add(trade_id)
+                                    current_content = (date, ticker, tx_type, float(abs(row['Units'])), float(price), float(fees))
+                                    previous = seen_stake_identifiers.setdefault(trade_id, [])
+                                    if any(content == current_content and other_file != file_number for content, other_file in previous):
+                                        d_skipped += 1
+                                        mark_sale(row, '重复记录', '跨文件编号/指纹及成交内容一致，未重复计入')
+                                        continue
+                                    if previous:
+                                        unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行：同一编号重复出现或内容不同，原始成交行均保留待核对')
+                                    previous.append((current_content, file_number))
 
-                                all_transactions.append({
-                                    'Date': pd.to_datetime(row['Trade Date']).tz_localize(None),
-                                    'Ticker': ticker,
-                                    'Market': market,
-                                    'Type': tx_type,
-                                    'Quantity': float(abs(row['Units'])),
-                                    'Price': float(price),
-                                    'Fees': float(fees),
-                                    'Source': f'Stake_{sheet.split()[0]}'
-                                })
-                                s_count += 1
+                                    all_transactions.append({
+                                        'Date': date,
+                                        'Sale ID': row.get('_Sale ID', ''),
+                                        'Ticker': ticker,
+                                        'Market': market,
+                                        'Type': tx_type,
+                                        'Quantity': float(abs(row['Units'])),
+                                        'Price': float(price),
+                                        'Fees': float(fees),
+                                        'Source': f'{f_file.name}/{sheet} 第 {row_index + 2} 行'
+                                    })
+                                    mark_sale(row, '已读入，等待 FIFO 计算')
+                                    s_count += 1
+                                except Exception as exc:
+                                    mark_sale(row, '解析失败，原始卖出行已保留', str(exc))
+                                    parse_errors.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行' + f'：{exc}')
+                                    uncertain_assets.add((market, ticker))
                             if s_count > 0:
                                 st.success(f"✅ 来自 [{f_file.name}] 的 [{sheet}]: 成功载入新记录 {s_count} 条")
                         except Exception as e:
@@ -299,6 +453,7 @@ if run_analysis:
             # --- 3. 运行 FIFO 清算引擎（保持原版全局历史匹配） ---
             if not all_transactions:
                 show_calculation_notes()
+                show_sales([])
                 st.error("❌ 未能在您上传的所有 Excel 中解析到合规的 BUY/SELL 交易。")
             else:
                 df_all = pd.DataFrame(all_transactions)
@@ -331,6 +486,7 @@ if run_analysis:
                     if (not all(np.isfinite(value) for value in (qty, price, fees)) or qty <= 0 or price < 0):
                         uncertain_assets.add(asset)
                         unresolved.append(f'{source} {ticker} {date}: 数量、价格或费用无效')
+                        mark_sale(row, '数量/价格/费用无效，待核对', '原始卖出行保留，未按零盈利处理')
                         continue
                     if asset not in portfolio:
                         portfolio[asset] = []
@@ -379,7 +535,8 @@ if run_analysis:
                         while qty_to_sell > quantity_tolerance:
                             if not portfolio[asset]:
                                 uncertain_assets.add(asset)
-                                unresolved.append(f'{source} {ticker} {date.date()}: {qty_to_sell:g} 股卖出缺少原始买入成本，未按零盈利处理')
+                                unresolved.append(f'{source} {ticker} {date.date()}: {qty_to_sell:g} 股卖出未匹配到原始买入成本；需检查导入、代码及去重，未按零盈利处理')
+                                mark_sale(row, '部分或全部买入成本未匹配', f'{qty_to_sell:g} 股尚未找到买入批次；需核对已读入的买入，已匹配批次仍保留')
                                 break
 
                             first_lot = portfolio[asset][0]
@@ -395,10 +552,17 @@ if run_analysis:
                             if fy_start <= date < fy_exclusive_end:
                                 cgt_events.append({
                                     'Ticker': ticker,
+                                    'Sale ID': row.get('Sale ID', ''),
                                     'Market': asset[0],
                                     'Buy Date': buy_date.strftime('%Y-%m-%d'),
                                     'Sell Date': date.strftime('%Y-%m-%d'),
                                     'Quantity': matched_qty,
+                                    'Buy Unit Price AUD': first_lot['price'],
+                                    'Buy Fee Per Share AUD': buy_fee_share,
+                                    'Matched Cost Base AUD': cost_base_per_share * matched_qty,
+                                    'Sell Unit Price AUD': price,
+                                    'Sell Fee Per Share AUD': sell_fee_share,
+                                    'Matched Net Proceeds AUD': proceeds_per_share * matched_qty,
                                     'Category': 'Held >= 1 Year (Discountable)' if is_discounted else 'Held < 1 Year (No Discount)',
                                     'Net Gain/Loss': total_gain_lot,
                                     'Buy Platform': first_lot['source'],
@@ -411,13 +575,17 @@ if run_analysis:
                             if first_lot['qty'] <= quantity_tolerance:
                                 portfolio[asset].pop(0)
 
-                # Missing cost invalidates this security's result, not all other
-                # securities. Never label the remaining subtotal a complete return.
-                cgt_events = [event for event in cgt_events
-                              if (event['Market'], event['Ticker']) not in uncertain_assets]
+                # Preserve every matched FIFO batch. An unresolved record must
+                # never delete other sale profits just because the ticker matches.
                 if start_year > 2025:
                     unresolved.append('当前使用原版个人 50% 折扣模型；2026-27 及以后财年政策未验证，金额仅供核对')
                 show_calculation_notes()
+                show_sales(cgt_events)
+                with st.expander('已读取的历史买入记录（核对导入是否完整）'):
+                    buys = df_all[df_all['Type'] == 'BUY'][['Date', 'Market', 'Ticker', 'Quantity', 'Price', 'Fees', 'Source']]
+                    st.dataframe(buys, hide_index=True, width='stretch')
+                    st.download_button('下载已读入买入记录 CSV', buys.to_csv(index=False).encode('utf-8-sig'),
+                                       file_name='imported_buys.csv', mime='text/csv', on_click='ignore')
                 is_complete = not (parse_errors or unresolved or (transfer_records and not same_owner))
 
                 # ==========================================
@@ -509,6 +677,8 @@ if run_analysis:
                     st.subheader("📋 各资产独立结算明细")
                     st.download_button('下载已知交易逐批次明细 CSV', cgt_df.to_csv(index=False).encode('utf-8-sig'),
                                        file_name=f'cgt_{TARGET_FY}.csv', mime='text/csv', on_click='ignore')
+                    with st.expander('每笔卖出对应的买入批次、成本及手续费'):
+                        st.dataframe(cgt_df, hide_index=True, width='stretch')
 
                     asset_summary = cgt_df.groupby(['Market', 'Ticker', 'Category'])['Net Gain/Loss'].sum().reset_index()
 

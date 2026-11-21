@@ -42,8 +42,69 @@ class ImportTests(unittest.TestCase):
     def test_unsupported_transfer_sale_is_not_silently_exempt(self):
         rows = [fixtures.nab_row(), fixtures.nab_row(day='2025-07-10', side='TRANSFER SALE', fee=0)]
         at = fixtures.run_reports(fixtures.workbook(rows, 'Nabtrade'), [fixtures.workbook([fixtures.stake_row()])])
-        self.assertFalse(any('净资本利得' in x.value for x in at.success))
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertTrue(any('非最终报税金额' in x.value for x in at.subheader))
         self.assertTrue(any('不能确定为普通转仓' in x.value for x in at.markdown))
+
+    def test_bad_row_does_not_drop_later_sales_in_same_report(self):
+        rows = [fixtures.stake_row(qty=50), fixtures.stake_row(day='2025-08-15', qty='bad'),
+                fixtures.stake_row(day='2025-09-01', qty=50)]
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row()], 'Nabtrade'), [fixtures.workbook(rows)])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        table = fixtures.sales_table(at)
+        self.assertEqual(len(table), 3)
+        self.assertTrue(any('解析失败' in status for status in table['处理结果']))
+
+    def test_sale_and_purchase_aliases_use_same_fifo(self):
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row(side='Purchase')], 'Nabtrade'),
+                                  [fixtures.workbook([fixtures.stake_row(side='Sale')])])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+
+    def test_day_first_july_sale_belongs_to_selected_fy(self):
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row(day='2024-01-01')], 'Nabtrade'),
+                                  [fixtures.workbook([fixtures.stake_row(day='01/07/2025')])])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertEqual(fixtures.sales_table(at).iloc[0]['卖出日期'], fixtures.pd.Timestamp('2025-07-01'))
+
+    def test_us_string_date_keeps_original_month_first_meaning(self):
+        rows = [fixtures.stake_row(day='01/01/2024', side='BUY', price=10, fee=10, code='AAPL', Currency='AUD'),
+                fixtures.stake_row(day='07/01/2025', price=12, fee=0, code='AAPL', Currency='AUD')]
+        at = fixtures.run_reports(stake=[fixtures.workbook(rows, sheet='Wall St Equities')])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertEqual(fixtures.sales_table(at).iloc[0]['卖出日期'], fixtures.pd.Timestamp('2025-07-01'))
+
+    def test_same_id_different_sales_are_not_deleted(self):
+        rows = [fixtures.stake_row(qty=50, **{'Trade Identifier': 'order-1'}),
+                fixtures.stake_row(day='2025-09-01', qty=50, **{'Trade Identifier': 'order-1'})]
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row()], 'Nabtrade'), [fixtures.workbook(rows)])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertTrue(all(fixtures.sales_table(at)['处理结果'] != '重复记录'))
+
+    def test_same_file_identical_id_rows_remain_visible_as_possible_split_fills(self):
+        row = fixtures.stake_row(qty=50, **{'Trade Identifier': 'order-1'})
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row()], 'Nabtrade'), [fixtures.workbook([row, row])])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertTrue(all(fixtures.sales_table(at)['处理结果'] != '重复记录'))
+
+    def test_exchange_suffixes_match_across_brokers(self):
+        at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row(code='ASX:ABC')], 'Nabtrade'),
+                                  [fixtures.workbook([fixtures.stake_row(code='ABC.ASX')])])
+        self.assertEqual(fixtures.gains(at), '$190.00')
+
+    def test_unconverted_foreign_sale_is_visible_even_without_calculable_trades(self):
+        us = fixtures.workbook([fixtures.stake_row(code='AAPL')], sheet='Wall St Equities')
+        at = fixtures.run_reports(stake=[us])
+        table = fixtures.sales_table(at)
+        self.assertEqual(table.iloc[0]['代码'], 'AAPL')
+        self.assertIn('待换算 AUD', table.iloc[0]['处理结果'])
+
+    def test_future_unconverted_trade_does_not_remove_this_year_gain(self):
+        rows = [dict(fixtures.nab_row(day='2024-01-01', code='AAPL'), **{'Average Price (AUD) *1': 10, 'Brokerage (AUD)': 10}),
+                dict(fixtures.nab_row(day='2025-08-01', side='SALE', code='AAPL'), **{'Average Price (AUD) *1': 12, 'Brokerage (AUD)': 0}),
+                fixtures.nab_row(day='2026-08-01', code='AAPL')]
+        at = fixtures.run_reports(fixtures.workbook(rows, 'Nabtrade', sheet='Int. Portfolio Transactions'))
+        self.assertEqual(fixtures.gains(at), '$190.00')
+        self.assertFalse(at.warning)
 
 
 if __name__ == '__main__':

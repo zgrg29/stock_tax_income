@@ -13,12 +13,12 @@ def engine(rows):
     loop = next(node for node in ast.walk(TREE) if isinstance(node, ast.For)
                 and isinstance(node.target, ast.Tuple)
                 and [getattr(t, 'id', '') for t in node.target.elts] == ['idx', 'row'])
-    helper = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'held_over_twelve_months')
+    helpers = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name in ('held_over_twelve_months', 'mark_sale')]
     env = {'pd': pd, 'np': np, 'portfolio': {}, 'cgt_events': [], 'uncertain_assets': set(),
-           'unresolved': [], 'fy_start': pd.Timestamp('2025-07-01'),
+           'unresolved': [], 'sale_records': [], 'fy_start': pd.Timestamp('2025-07-01'),
            'fy_exclusive_end': pd.Timestamp('2026-07-01'),
            'df_all': pd.DataFrame(rows).sort_values('Date', kind='stable')}
-    exec(compile(ast.Module(body=[helper, loop], type_ignores=[]), 'app.py', 'exec'), env)
+    exec(compile(ast.Module(body=helpers + [loop], type_ignores=[]), 'app.py', 'exec'), env)
     return env
 
 
