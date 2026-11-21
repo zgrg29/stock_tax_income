@@ -18,6 +18,9 @@ def held_over_twelve_months(bought, sold):
 
 def transaction_type(value):
     action = ' '.join(str(value).upper().split())
+    if action in ('TRANSFER_IN', 'TRANSFER_OUT', 'STOCK_TRANSFER_IN', 'STOCK_TRANSFER_OUT',
+                  'BROKER_TRANSFER_IN', 'BROKER_TRANSFER_OUT', 'SECURITY_TRANSFER_IN', 'SECURITY_TRANSFER_OUT'):
+        action = action.replace('_', ' ')
     return {'B': 'BUY', 'PURCHASE': 'BUY', 'BOUGHT': 'BUY',
             'S': 'SELL', 'SALE': 'SELL', 'SOLD': 'SELL'}.get(action, action)
 
@@ -25,7 +28,7 @@ def transaction_type(value):
 def security_code(value, market):
     code = str(value).strip().upper()
     prefixes = ('ASX:', 'AU:') if market == 'AU' else ('NASDAQ:', 'NYSE:', 'NYSEARCA:', 'US:')
-    suffixes = ('.AX', '.ASX', '.AU') if market == 'AU' else ('.US',)
+    suffixes = ('.AX', '.ASX', '.AU', '.AXW', '.CXA') if market == 'AU' else ('.US',)
     for prefix in prefixes:
         if code.startswith(prefix):
             code = code[len(prefix):]
@@ -106,6 +109,7 @@ transfer_records = []
 unresolved = []
 uncertain_assets = set()
 parse_errors = []
+corporate_records = []
 transfer_types = {'TRANSFER', 'TRANSFER IN', 'TRANSFER OUT', 'STOCK TRANSFER',
                   'STOCK TRANSFER IN', 'STOCK TRANSFER OUT', 'INWARD TRANSFER',
                   'OUTWARD TRANSFER', 'BROKER TRANSFER IN', 'BROKER TRANSFER OUT',
@@ -121,7 +125,7 @@ def record_transfer(row, action, source, row_number, ticker, date_column, quanti
     """Retain source rows; do not create acquisitions or estimate missing cost."""
     transfer_records.append({'来源': source, 'Excel 行号': row_number,
                              '代码': ticker, '日期': str(row.get(date_column, '')),
-                             '数量': row.get(quantity_column, ''), '原始类型': action,
+                             '数量': row.get(quantity_column, ''), '原始类型': row.get('Movement Type', row.get('Side', action)),
                              '受益所有权': '用户确认未改变' if same_owner else '未验证',
                              '处理': '仅在所有权未变的前提下，不改变全局历史持仓'})
     changed = str(row.get('Beneficial Ownership Changed', '')).strip().upper() == 'YES'
@@ -155,6 +159,129 @@ def show_calculation_notes():
         if len(notes) > 3:
             with st.expander('查看其余待核对记录'):
                 st.dataframe(pd.DataFrame({'需核对事项': notes[3:]}), hide_index=True, width='stretch')
+
+
+def corporate_note(tx, status, detail):
+    corporate_records.append({'日期': tx['Date'], '代码': tx['Ticker'], '原始类型': tx.get('Raw Type', tx['Type']),
+                              '数量': tx.get('Signed Quantity', tx['Quantity']), '来源': tx['Source'],
+                              '处理': status, '说明': detail})
+
+
+def prepare_corporate_actions(transactions):
+    """Interpret report movements without replacing the original FIFO engine.
+
+    Paid allotments have independent lots. Paired changes move existing lots;
+    report carrying values/fees are never charged a second time. Unknown tax
+    treatment is retained on the lot, not invented as a zero cost acquisition.
+    """
+    result = [dict(tx) for tx in transactions]
+    paired = {'TRADABLE_RIGHTS_CONVERSION', 'RHT - RENOUNCEABLE RIGHTS ISSUE ALLOTMENT',
+              'CHANGE_SECURITY_CODE', 'RECONSTRUCTION'}
+    groups = {}
+    for tx in result:
+        kind = tx['Type']
+        tx['Raw Type'] = kind
+        if kind in ('DRP - DIVIDEND PLAN ALLOTMENT', 'SPP - SHARE PURCHASE PLAN'):
+            paid = tx.get('Reported Value', np.nan)
+            if pd.isna(paid):
+                paid = tx['Price'] * tx['Quantity']
+            if tx.get('Signed Quantity', tx['Quantity']) > 0 and np.isfinite(paid) and paid > 0:
+                tx['Price'], tx['Type'] = float(paid) / tx['Quantity'], 'BUY'
+                corporate_note(tx, '已计入独立买入批次', '使用报表实际分配金额及原始发行日期；不按普通现金分红忽略')
+            else:
+                tx['Type'] = 'ACQUIRE_UNVERIFIED'
+        elif kind == 'TRADABLE_RIGHTS_ISSUE' and tx.get('Signed Quantity', 0) > 0:
+            if tx['Price'] == 0 and tx.get('Reported Value', np.nan) == 0:
+                tx['Type'] = 'BUY'
+                corporate_note(tx, '已记录免费获配权利', '报表明确金额为零；行权时承接权利成本并加入实际认购金额')
+            else:
+                tx['Type'] = 'ACQUIRE_UNVERIFIED'
+        elif kind in ('ADJUSTMENT_INCREASE', 'BSP - BONUS PLAN ALLOTMENT'):
+            tx['Type'] = 'ACQUIRE_UNVERIFIED' if tx.get('Signed Quantity', tx['Quantity']) > 0 else 'REMOVE_UNVERIFIED'
+            tx['Review Existing Lots'] = True
+        elif kind in paired:
+            key = (tx['Date'], tx['Market'], tx.get('Report', ''), tx.get('Account', ''), kind)
+            groups.setdefault(key, []).append(tx)
+    for key, legs in groups.items():
+        outgoing = [t for t in legs if t.get('Signed Quantity', 0) < 0]
+        incoming = [t for t in legs if t.get('Signed Quantity', 0) > 0]
+        if (len(legs) == 2 and len(outgoing) == len(incoming) == 1
+                and outgoing[0]['Ticker'] != incoming[0]['Ticker']
+                and np.isclose(outgoing[0]['Quantity'], incoming[0]['Quantity'], rtol=1e-12, atol=1e-9)):
+            old, new = outgoing[0], incoming[0]
+            old['Type'] = 'PAIRED_ACTION_LEG'
+            new.update({'Type': 'EXERCISE_RIGHTS' if key[-1] == 'TRADABLE_RIGHTS_CONVERSION' else 'MOVE_LOTS',
+                        'From Ticker': old['Ticker'], 'Counterpart Source': old['Source'],
+                        'Tax Review': key[-1] == 'RECONSTRUCTION'})
+        else:
+            for tx in legs:
+                tx['Type'] = 'ACQUIRE_UNVERIFIED' if tx.get('Signed Quantity', 0) > 0 else 'REMOVE_UNVERIFIED'
+    return result
+
+
+def apply_corporate_action(row, portfolio):
+    """Return True when a non-trade corporate action was handled."""
+    action, key = row['Type'], (row['Market'], row['Ticker'])
+    if action == 'PAIRED_ACTION_LEG':
+        return True
+    if action == 'ACQUIRE_UNVERIFIED':
+        lots = portfolio.setdefault(key, [])
+        # A bonus/allocation can change the cost allocation of existing lots.
+        if row.get('Review Existing Lots', False) == True:
+            for lot in lots:
+                lot['cost_known'] = False
+        lots.append({'date': row['Date'], 'qty': row['Quantity'], 'price': np.nan,
+                     'fees': 0.0, 'source': row['Source'], 'cost_known': False})
+        corporate_note(row, '数量已计入，税务成本待核对', '原始增持记录存在；未把报表估值、赠股分红参数或未知调整金额当作已确认税务成本')
+        return True
+    if action not in ('MOVE_LOTS', 'EXERCISE_RIGHTS', 'REMOVE_UNVERIFIED'):
+        return False
+    source_key = (row['Market'], row.get('From Ticker')) if action != 'REMOVE_UNVERIFIED' else key
+    source_lots = portfolio.setdefault(source_key, [])
+    if action == 'REMOVE_UNVERIFIED':
+        for lot in source_lots:
+            lot['cost_known'] = False
+    quantity = row['Quantity']
+    available = sum(lot['qty'] for lot in source_lots)
+    if available + 1e-9 < quantity:
+        corporate_note(row, '来源批次数量未对上', f'来源 {source_key[1]} 已读入 {available:g} 股，需要 {quantity:g} 股')
+        unresolved.append(f"{row['Source']}: 公司行动来源数量未对上，需核对原始配对记录")
+        return True
+    moved, remaining = [], quantity
+    while remaining > 1e-9:
+        lot = source_lots[0]
+        take = min(remaining, lot['qty'])
+        unit_fee = lot['fees'] / lot['qty']
+        moved.append(dict(lot, qty=take, fees=unit_fee * take))
+        lot['fees'] -= unit_fee * take
+        lot['qty'] -= take
+        remaining -= take
+        if lot['qty'] <= 1e-9:
+            source_lots.pop(0)
+    known = all(lot.get('cost_known', True) and np.isfinite(lot['price']) for lot in moved)
+    if action == 'EXERCISE_RIGHTS':
+        paid = row.get('Reported Value', np.nan)
+        if pd.isna(paid):
+            paid = row['Price'] * quantity
+        known = known and np.isfinite(paid) and paid >= 0
+        cost = sum(lot['price'] * lot['qty'] + lot['fees'] for lot in moved) + paid + row['Fees'] if known else np.nan
+        moved = [{'date': row['Date'], 'qty': quantity, 'price': cost / quantity,
+                  'fees': 0.0, 'source': row['Source'], 'cost_known': bool(known)}]
+    if action != 'REMOVE_UNVERIFIED':
+        review = row.get('Tax Review', False) == True
+        if review:
+            for lot in moved:
+                lot['cost_known'] = False
+        portfolio.setdefault(key, []).extend(moved)
+        portfolio[key].sort(key=lambda lot: lot['date'])
+        corporate_note(row, '已承接原始批次' if not review else '已承接数量，重组税务条件待核对',
+                       '行权采用行权日及原权利成本加认购款' if action == 'EXERCISE_RIGHTS' else
+                       '保留原购入日、原始成本和手续费，不重复计入报表结转费用；一般重组仍须核对 rollover')
+    else:
+        corporate_note(row, '数量已扣减，税务处理待核对', '未配对的移出不自动当作免税转仓')
+    if (action == 'REMOVE_UNVERIFIED' or row.get('Tax Review', False) == True) and fy_start <= row['Date'] < fy_exclusive_end:
+        unresolved.append(f"{row['Source']}: 当年公司行动是否触发 CGT 尚待核对，未假定自动 rollover")
+    return True
 
 
 def capture_sales(frame, source, market, date_col, symbol_col, side_col, qty_col, price_col, first_row):
@@ -214,7 +341,10 @@ def show_sales(events):
         record['已匹配数量'] = matched
         record['已匹配盈亏 AUD（待核对时非最终金额）'] = sum(event['Net Gain/Loss'] for event in matches)
         raw_qty = pd.to_numeric(record['卖出数量'], errors='coerce')
-        if pd.isna(raw_qty) or not np.isclose(matched, abs(raw_qty), rtol=1e-10, atol=1e-12):
+        if any(not np.isfinite(event['Net Gain/Loss']) for event in matches):
+            record['处理结果'] = '数量已匹配，税务成本待核对'
+            record['说明'] = '对应公司行动成本尚未确认；不把未知税务成本当零'
+        elif pd.isna(raw_qty) or not np.isclose(matched, abs(raw_qty), rtol=1e-10, atol=1e-12):
             record['处理结果'] = '部分匹配，剩余成本缺失'
         elif (record['市场'], record['代码']) in uncertain_assets:
             record['处理结果'] = '已匹配，相关历史或成本待核对'
@@ -280,6 +410,10 @@ if run_analysis:
                                 'Market': 'AU',
                                 'Type': tx_type,
                                 'Quantity': float(abs(row['Quantity'])),
+                                'Signed Quantity': float(row['Quantity']),
+                                'Reported Value': row.get('Value', np.nan),
+                                'Report': nabtrade_file.name,
+                                'Account': str(row.get('Account', '')),
                                 'Price': float(row['Transaction Price']),
                                 'Fees': fee_value(row, 'Brokerage') + fee_value(row, 'Other Fees'),
                                 'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
@@ -331,6 +465,10 @@ if run_analysis:
                                 'Market': 'US',
                                 'Type': tx_type,
                                 'Quantity': float(abs(row['Quantity'])),
+                                'Signed Quantity': float(row['Quantity']),
+                                'Reported Value': row.get('Value (AUD)', np.nan),
+                                'Report': nabtrade_file.name,
+                                'Account': str(row.get('Account', '')),
                                 'Price': float(row.get('Average Price (AUD) *1', 0)),
                                 'Fees': fee_value(row, 'Brokerage (AUD)') + fee_value(row, 'Other Fees (AUD)'),
                                 'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
@@ -456,6 +594,7 @@ if run_analysis:
                 show_sales([])
                 st.error("❌ 未能在您上传的所有 Excel 中解析到合规的 BUY/SELL 交易。")
             else:
+                all_transactions = prepare_corporate_actions(all_transactions)
                 df_all = pd.DataFrame(all_transactions)
                 df_all = df_all.sort_values('Date', kind='stable').reset_index(drop=True)
 
@@ -478,6 +617,12 @@ if run_analysis:
                     if date >= fy_exclusive_end:
                         continue
                     if action in ('DIVIDEND', 'INTEREST', 'CASH', 'DEPOSIT', 'WITHDRAWAL'):
+                        continue
+                    if action in ('PAIRED_ACTION_LEG', 'ACQUIRE_UNVERIFIED', 'REMOVE_UNVERIFIED', 'MOVE_LOTS', 'EXERCISE_RIGHTS'):
+                        if not np.isfinite(qty) or qty <= 0:
+                            unresolved.append(f'{source}: 公司行动数量无效')
+                            continue
+                        apply_corporate_action(row, portfolio)
                         continue
                     if action not in ('BUY', 'SELL', 'RETURN_OF_CAPITAL', 'TRANSFER_CHECK'):
                         uncertain_assets.add(asset)
@@ -508,6 +653,10 @@ if run_analysis:
                         reduction_per_share = float(reduction_per_share)
                         if total_holding > 0:
                             for lot in portfolio[asset]:
+                                if not lot.get('cost_known', True) or not np.isfinite(lot['price']):
+                                    if fy_start <= date < fy_exclusive_end:
+                                        unresolved.append(f'{source} {ticker}: 资本返还涉及尚未确认的公司行动成本，未猜测超额利得')
+                                    continue
                                 original_cost = lot['price'] + lot['fees'] / lot['qty']
                                 excess = max(0.0, reduction_per_share - original_cost)
                                 if excess > 0 and fy_start <= date < fy_exclusive_end:
@@ -545,11 +694,15 @@ if run_analysis:
 
                             matched_qty = min(qty_to_sell, first_lot['qty'])
                             buy_fee_share = first_lot['fees'] / first_lot['qty'] if first_lot['qty'] > 0 else 0
-                            cost_base_per_share = first_lot['price'] + buy_fee_share
+                            cost_known = first_lot.get('cost_known', True) and np.isfinite(first_lot['price'])
+                            cost_base_per_share = first_lot['price'] + buy_fee_share if cost_known else np.nan
                             proceeds_per_share = price - sell_fee_share
                             total_gain_lot = (proceeds_per_share - cost_base_per_share) * matched_qty
 
                             if fy_start <= date < fy_exclusive_end:
+                                if not cost_known:
+                                    uncertain_assets.add(asset)
+                                    unresolved.append(f'{source} {ticker}: 数量已匹配，但对应公司行动税务成本需核对，不按零成本计算')
                                 cgt_events.append({
                                     'Ticker': ticker,
                                     'Sale ID': row.get('Sale ID', ''),
@@ -563,7 +716,8 @@ if run_analysis:
                                     'Sell Unit Price AUD': price,
                                     'Sell Fee Per Share AUD': sell_fee_share,
                                     'Matched Net Proceeds AUD': proceeds_per_share * matched_qty,
-                                    'Category': 'Held >= 1 Year (Discountable)' if is_discounted else 'Held < 1 Year (No Discount)',
+                                    'Cost Status': '已确认' if cost_known else '公司行动成本待核对',
+                                    'Category': ('Held >= 1 Year (Discountable)' if is_discounted else 'Held < 1 Year (No Discount)') if cost_known else 'Cost/Acquisition Unverified',
                                     'Net Gain/Loss': total_gain_lot,
                                     'Buy Platform': first_lot['source'],
                                     'Sell Platform': source
@@ -580,6 +734,10 @@ if run_analysis:
                 if start_year > 2025:
                     unresolved.append('当前使用原版个人 50% 折扣模型；2026-27 及以后财年政策未验证，金额仅供核对')
                 show_calculation_notes()
+                if corporate_records:
+                    st.info(f'已识别 {len(corporate_records)} 项增持/公司行动；数量已参与库存，成本或重组条件待核对的记录保留在明细中。')
+                    with st.expander('查看增持及公司行动处理明细'):
+                        st.dataframe(pd.DataFrame(corporate_records), hide_index=True, width='stretch')
                 show_sales(cgt_events)
                 with st.expander('已读取的历史买入记录（核对导入是否完整）'):
                     buys = df_all[df_all['Type'] == 'BUY'][['Date', 'Market', 'Ticker', 'Quantity', 'Price', 'Fees', 'Source']]
@@ -680,7 +838,7 @@ if run_analysis:
                     with st.expander('每笔卖出对应的买入批次、成本及手续费'):
                         st.dataframe(cgt_df, hide_index=True, width='stretch')
 
-                    asset_summary = cgt_df.groupby(['Market', 'Ticker', 'Category'])['Net Gain/Loss'].sum().reset_index()
+                    asset_summary = cgt_df.groupby(['Market', 'Ticker', 'Category'])['Net Gain/Loss'].sum(min_count=1).reset_index()
 
                     for _, row in asset_summary.iterrows():
                         ticker = f"{row['Market']}:{row['Ticker']}"
@@ -688,7 +846,10 @@ if run_analysis:
                         gain_loss = row['Net Gain/Loss']
 
                         # 根据盈亏赋予不同的视觉前缀和颜色
-                        if gain_loss >= 0:
+                        if pd.isna(gain_loss):
+                            status_badge = '⚪ 公司行动成本待核对'
+                            bg_color = 'rgba(128, 128, 128, 0.1)'
+                        elif gain_loss >= 0:
                             status_badge = "🟢 净盈利"
                             bg_color = "rgba(40, 167, 69, 0.1)"
                         else:
@@ -707,7 +868,7 @@ if run_analysis:
                             ">
                                 <b style="font-size:16px;">资产代码: {ticker}</b><br/>
                                 <span style="font-size:13px; color:#6c757d;">持有类型: {cat}</span><br/>
-                                <span style="font-size:14px; font-weight:bold;">{status_badge}: ${abs(gain_loss):,.2f}</span>
+                                <span style="font-size:14px; font-weight:bold;">{status_badge}: {'暂不可计算' if pd.isna(gain_loss) else f'${abs(gain_loss):,.2f}'}</span>
                             </div>
                             """,
                             unsafe_allow_html=True

@@ -4,6 +4,24 @@ import test_app as fixtures
 
 
 class ImportTests(unittest.TestCase):
+    def test_axw_cxa_suffixes_and_underscore_transfer_match_stake(self):
+        for suffix in ('.AXW', '.CXA'):
+            rows = [fixtures.nab_row(day='2024-01-01', code='FUND'+suffix),
+                    fixtures.nab_row(day='2025-07-01', side='TRANSFER_OUT', code='FUND'+suffix, fee=0)]
+            at = fixtures.run_reports(fixtures.workbook(rows, 'Nabtrade'),
+                                      [fixtures.workbook([fixtures.stake_row(code='FUND')])], same_owner=True)
+            self.assertEqual(fixtures.gains(at), '$190.00')
+            self.assertEqual(fixtures.sales_table(at).iloc[0]['处理结果'], '已计算')
+            self.assertFalse(at.warning)
+
+    def test_drp_is_not_reported_as_missing_buy(self):
+        rows = [fixtures.nab_row(day='2024-01-01', side='DRP - Dividend Plan Allotment',
+                                 qty=10, price=7.1234, fee=0, Value=71.23)]
+        at = fixtures.run_reports(fixtures.workbook(rows, 'Nabtrade'),
+                                  [fixtures.workbook([fixtures.stake_row(qty=10, price=9)])])
+        self.assertEqual(fixtures.gains(at), '$18.77')
+        self.assertEqual(fixtures.sales_table(at).iloc[0]['处理结果'], '已计算')
+        self.assertFalse(at.warning)
     def test_blank_identifiers_preserve_distinct_real_rows(self):
         sales = [fixtures.stake_row(qty=50), fixtures.stake_row(qty=50)]
         at = fixtures.run_reports(fixtures.workbook([fixtures.nab_row()], 'Nabtrade'),
