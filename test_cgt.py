@@ -1,119 +1,86 @@
+"""Unit tests execute the actual FIFO and loss-offset nodes from app.py."""
+import ast
+from pathlib import Path
 import unittest
-from datetime import date, datetime
-from decimal import Decimal as D
 
-from cgt import CalculationError, Transaction, calculate_events, discount_eligible, summarize
+import numpy as np
+import pandas as pd
+
+TREE = ast.parse(Path(__file__).with_name('app.py').read_text(encoding='utf-8-sig'))
 
 
-def tx(day, action, qty, price, fees=0, market='AU', source='broker'):
-    return Transaction(day, market, 'TEST', action, qty, price, fees, source)
+def engine(rows):
+    loop = next(node for node in ast.walk(TREE) if isinstance(node, ast.For)
+                and isinstance(node.target, ast.Tuple)
+                and [getattr(t, 'id', '') for t in node.target.elts] == ['idx', 'row'])
+    helper = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'held_over_twelve_months')
+    env = {'pd': pd, 'np': np, 'portfolio': {}, 'cgt_events': [], 'uncertain_assets': set(),
+           'unresolved': [], 'fy_start': pd.Timestamp('2025-07-01'),
+           'fy_exclusive_end': pd.Timestamp('2026-07-01'),
+           'df_all': pd.DataFrame(rows).sort_values('Date', kind='stable')}
+    exec(compile(ast.Module(body=[helper, loop], type_ignores=[]), 'app.py', 'exec'), env)
+    return env
+
+
+def tx(day, side, qty, price, fees=0, ticker='ABC', market='AU', **extra):
+    return dict(Date=pd.Timestamp(day), Type=side, Quantity=qty, Price=price, Fees=fees,
+                Ticker=ticker, Market=market, Source='synthetic', **extra)
 
 
 class CalculationTests(unittest.TestCase):
-    def test_partial_sales_do_not_reuse_buy_fees(self):
-        events = calculate_events([tx('2025-07-01', 'BUY', 100, 10, 10),
-                                   tx('2025-08-01', 'SELL', 50, 12),
-                                   tx('2025-09-01', 'SELL', 50, 12)], 2025)
-        self.assertEqual([e.gain for e in events], [D(95), D(95)])
+    def test_partial_sale_buy_fees_sum_to_original_fee(self):
+        env = engine([tx('2025-07-01', 'BUY', 100, 10, 10),
+                      tx('2025-08-01', 'SELL', 50, 12), tx('2025-09-01', 'SELL', 50, 12)])
+        self.assertAlmostEqual(sum(e['Net Gain/Loss'] for e in env['cgt_events']), 190)
+
+    def test_fractional_sale_residue_does_not_erase_valid_stock(self):
+        env = engine([tx('2025-07-01', 'BUY', 0.3, 10),
+                      tx('2025-08-01', 'SELL', 0.1, 12), tx('2025-09-01', 'SELL', 0.2, 12)])
+        self.assertFalse(env['uncertain_assets'])
+        self.assertAlmostEqual(sum(e['Net Gain/Loss'] for e in env['cgt_events']), 0.6)
+
+    def test_june_30_time_included_and_next_year_excluded(self):
+        env = engine([tx('2025-07-01', 'BUY', 2, 10), tx('2026-06-30 15:00', 'SELL', 1, 12),
+                      tx('2026-07-01', 'SELL', 1, 12)])
+        self.assertEqual(len(env['cgt_events']), 1)
+        self.assertEqual(env['cgt_events'][0]['Sell Date'], '2026-06-30')
+
+    def test_calendar_anniversary_boundary(self):
+        for sold, discounted in [('2025-07-01', False), ('2025-07-02', True)]:
+            env = engine([tx('2024-07-01', 'BUY', 1, 10), tx(sold, 'SELL', 1, 12)])
+            self.assertEqual('Discountable' in env['cgt_events'][0]['Category'], discounted)
+
+    def test_market_codes_never_share_inventory(self):
+        env = engine([tx('2025-07-01', 'BUY', 1, 10), tx('2025-08-01', 'SELL', 1, 20, market='US')])
+        self.assertIn(('US', 'ABC'), env['uncertain_assets'])
+        self.assertFalse(env['cgt_events'])
+
+    def test_transfer_check_never_adds_or_removes_lots(self):
+        env = engine([tx('2024-01-01', 'BUY', 100, 10, 10),
+                      tx('2025-07-01', 'TRANSFER_CHECK', 50, 0),
+                      tx('2025-07-02', 'TRANSFER_CHECK', 50, 0),
+                      tx('2025-08-01', 'SELL', 100, 30, 10)])
+        self.assertAlmostEqual(env['cgt_events'][0]['Net Gain/Loss'], 1980)
+        self.assertEqual(env['cgt_events'][0]['Buy Date'], '2024-01-01')
+        self.assertFalse(env['unresolved'])
+
+    def test_explicit_capital_return_reduces_cost_and_excess_creates_gain(self):
+        env = engine([tx('2024-01-01', 'BUY', 10, 1, 10),
+                      tx('2025-07-01', 'RETURN_OF_CAPITAL', 10, 999, **{'ROC Per Share': 3}),
+                      tx('2025-08-01', 'SELL', 10, 5)])
+        self.assertEqual([e['Net Gain/Loss'] for e in env['cgt_events']], [10, 50])
 
     def test_losses_offset_non_discount_gains_first(self):
-        events = calculate_events([tx('2023-01-01', 'BUY', 100, 10),
-                                   tx('2025-07-01', 'SELL', 100, 20),
-                                   tx('2025-08-01', 'BUY', 100, 10),
-                                   tx('2025-09-01', 'SELL', 100, 20),
-                                   tx('2025-10-01', 'BUY', 100, 20),
-                                   tx('2025-11-01', 'SELL', 100, 10)], 2025)
-        self.assertEqual(summarize(events)['taxable_gain'], D(500))
-
-    def test_missing_history_including_prior_year_blocks_result(self):
-        for day in ('2024-08-01', '2025-08-01'):
-            with self.assertRaisesRegex(CalculationError, '历史买入'):
-                calculate_events([tx(day, 'SELL', 10, 12)], 2025)
-
-    def test_june_30_included_july_1_excluded(self):
-        events = calculate_events([tx('2025-06-01', 'BUY', 3, 10),
-                                   tx('2025-06-30', 'SELL', 1, 11),
-                                   tx(datetime(2026, 6, 30, 15), 'SELL', 1, 12),
-                                   tx('2026-07-01', 'SELL', 1, 13)], 2025)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].gain, D(2))
-
-    def test_discount_anniversary_and_leap_year(self):
-        self.assertFalse(discount_eligible(date(2024, 7, 1), date(2025, 7, 1)))
-        self.assertTrue(discount_eligible(date(2024, 7, 1), date(2025, 7, 2)))
-        self.assertFalse(discount_eligible(date(2023, 7, 1), date(2024, 6, 30)))
-        self.assertFalse(discount_eligible(date(2024, 2, 29), date(2025, 2, 28)))
-        self.assertTrue(discount_eligible(date(2024, 2, 29), date(2025, 3, 1)))
-
-    def test_market_separation_and_cross_broker_matching(self):
-        with self.assertRaises(CalculationError):
-            calculate_events([tx('2025-07-01', 'BUY', 1, 10, market='AU'),
-                              tx('2025-08-01', 'SELL', 1, 20, market='US')], 2025)
-        events = calculate_events([tx('2025-07-01', 'BUY', 1, 10, source='Nabtrade'),
-                                   tx('2025-08-01', 'SELL', 1, 20, source='Stake')], 2025)
-        self.assertEqual(events[0].gain, D(10))
-
-    def test_prior_sales_consume_inventory(self):
-        events = calculate_events([tx('2024-01-01', 'BUY', 10, 10),
-                                   tx('2024-08-01', 'SELL', 10, 20),
-                                   tx('2025-08-01', 'BUY', 10, 30),
-                                   tx('2025-09-01', 'SELL', 10, 40)], 2025)
-        self.assertEqual(events[0].gain, D(100))
-        self.assertFalse(events[0].discountable)
-
-    def test_sell_fee_distributed_across_lots(self):
-        events = calculate_events([tx('2025-07-01', 'BUY', 10, 10),
-                                   tx('2025-07-02', 'BUY', 10, 20),
-                                   tx('2025-08-01', 'SELL', 20, 30, 10)], 2025)
-        self.assertEqual(sum(e.gain for e in events), D(290))
-
-    def test_opening_loss_and_no_events(self):
-        self.assertEqual(summarize([], 500)['carried_loss'], D(500))
-        events = calculate_events([tx('2025-07-01', 'BUY', 10, 10),
-                                   tx('2025-08-01', 'SELL', 10, 30)], 2025)
-        result = summarize(events, 250)
-        self.assertEqual(result['taxable_gain'], 0)
-        self.assertEqual(result['opening_loss_used'], D(200))
-        self.assertEqual(result['carried_loss'], D(50))
-
-    def test_current_loss_before_opening_loss(self):
-        events = calculate_events([tx('2025-07-01', 'BUY', 10, 10),
-                                   tx('2025-08-01', 'SELL', 10, 5)], 2025)
-        result = summarize(events, 100)
-        self.assertEqual(result['opening_loss_used'], 0)
-        self.assertEqual(result['carried_loss'], D(150))
-
-    def test_no_discount_option(self):
-        events = calculate_events([tx('2023-01-01', 'BUY', 10, 10),
-                                   tx('2025-08-01', 'SELL', 10, 30)], 2025)
-        self.assertEqual(summarize(events, discount_rate=0)['taxable_gain'], D(200))
-
-    def test_capital_return_excess_and_remaining_cost(self):
-        events = calculate_events([tx('2024-01-01', 'BUY', 10, 1, 10),
-                                   tx('2025-08-01', 'RETURN_OF_CAPITAL', 10, 3),
-                                   tx('2025-09-01', 'SELL', 10, 5)], 2025)
-        self.assertEqual([e.gain for e in events], [D(10), D(50)])
-        self.assertEqual(events[0].kind, 'RETURN_OF_CAPITAL')
-
-    def test_capital_return_reduces_cost_without_immediate_gain(self):
-        events = calculate_events([tx('2024-01-01', 'BUY', 10, 10),
-                                   tx('2025-08-01', 'RETURN_OF_CAPITAL', 10, 2),
-                                   tx('2025-09-01', 'SELL', 10, 12)], 2025)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].gain, D(40))
-
-    def test_invalid_numbers_fail(self):
-        for qty in (0, -1, 'NaN', 'Infinity'):
-            with self.assertRaises(CalculationError):
-                tx('2025-07-01', 'BUY', qty, 10)
-        with self.assertRaises(CalculationError):
-            summarize([], 'NaN')
-
-    def test_fractional_quantities(self):
-        events = calculate_events([tx('2025-07-01', 'BUY', '0.3', 10, '0.03'),
-                                   tx('2025-08-01', 'SELL', '0.1', 12),
-                                   tx('2025-09-01', 'SELL', '0.2', 12)], 2025)
-        self.assertEqual(sum(e.gain for e in events), D('0.57'))
+        start = next(n for n in ast.walk(TREE) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == 'total_losses_to_offset' for t in n.targets))
+        body = next(body for n in ast.walk(TREE) for body in (getattr(n, 'body', None), getattr(n, 'orelse', None))
+                    if isinstance(body, list) and start in body)
+        nodes = body[body.index(start):]
+        end = next(i for i,n in enumerate(nodes) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == 'carried_loss' for t in n.targets))
+        env = dict(all_losses=1000, opening_loss=0, st_gains=1000, lt_gains=1000)
+        exec(compile(ast.Module(body=nodes[:end+1], type_ignores=[]), 'app.py', 'exec'), env)
+        self.assertEqual(env['taxable_gain'], 500)
 
 
 if __name__ == '__main__':

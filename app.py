@@ -1,155 +1,546 @@
-"""Streamlit interface for validated, AUD-denominated FIFO CGT calculations."""
-from dataclasses import asdict
-from datetime import datetime
-from decimal import Decimal
-import json
-from zoneinfo import ZoneInfo
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
-from stock_tax.cgt import CalculationError, summarize
-from stock_tax.importers import (BrokerImporter, load_rates, load_accounts, load_transfer_reviews,
-                                 CONFIRMED, REVIEW, BLOCKED, INVALID)
+
+def fee_value(row, column):
+    """Preserve original optional fee columns, treating blank cells as zero."""
+    value = row.get(column, 0)
+    return 0.0 if pd.isna(value) else float(value)
 
 
-def show_import_audit(importer, ledger):
-    """Bounded summary banners, with every original row available for inspection."""
-    if importer.transfer_audit:
-        records = pd.DataFrame(importer.transfer_audit).fillna('')
-        counts = records['Status'].value_counts()
-        message = (f'检测到 {len(records)} 条转仓记录（报表行）：'
-                   f"{counts.get(CONFIRMED, 0)} 条已确认，{counts.get(REVIEW, 0)} 条需要核对，"
-                   f"{counts.get(BLOCKED, 0)} 条计算受阻，{counts.get(INVALID, 0)} 条数据错误。")
-        if any(r['Blocks CGT'] for r in importer.transfer_audit):
-            st.warning(message)
-        else:
-            st.info(message)
-        st.caption('“已确认”依据提供的账户受益权证据、两端记录及历史批次校验；不是独立身份认证。转入/转出分别计行，重复腿只保留审计，不重复计仓。')
-        with st.expander('转仓核对明细与原因汇总'):
-            groups = records.groupby(['Status', 'Reason'], dropna=False).size().reset_index(name='记录数')
-            st.dataframe(groups.rename(columns={'Status': '状态', 'Reason': '原因'}), hide_index=True, width='stretch')
-            labels = {'Record ID': '记录标识', 'File': '文件', 'Sheet': '工作表', 'Excel Row': 'Excel 行号',
-                      'Ticker': '股票/ETF', 'Date': '日期', 'Quantity': '数量', 'Direction': '方向',
-                      'Account': '报告账户', 'Status': '状态', 'Reason': '识别结果',
-                      'Original Purchase': '原始买入记录', 'Cost Complete': '成本完整（基于导入数据）',
-                      'Blocks CGT': '阻止本财年计算', 'CGT Impact': 'CGT 影响', 'Required Action': '所需操作'}
-            st.dataframe(records.reindex(columns=list(labels), fill_value='').rename(columns=labels),
-                         hide_index=True, width='stretch')
-            st.download_button('下载完整转仓审计 CSV', records.to_csv(index=False).encode('utf-8-sig'),
-                               'transfer_audit.csv', 'text/csv', on_click='ignore')
-            review_columns = ['Record ID', 'Direction', 'Transfer Identifier', 'Reconciliation ID', 'Counterparty Broker', 'Counterparty Account', 'Evidence']
-            pending = records[records['Status'] != CONFIRMED].reindex(columns=review_columns, fill_value='')
-            st.download_button('下载待核对转仓补充证据模板', pending.to_csv(index=False).encode('utf-8-sig'),
-                               'transfer_reviews.csv', 'text/csv', on_click='ignore')
-    if importer.warnings:
-        st.info(f'另有 {len(importer.warnings)} 条导入提示（如重复文件/成交），已合并到下方。')
-    with st.expander('完整导入审计与计算问题'):
-        if importer.warnings:
-            st.dataframe(pd.DataFrame({'导入提示': importer.warnings}), hide_index=True, width='stretch')
-        errors = importer.errors + importer.ordering_errors() + ledger.errors
-        if errors:
-            st.dataframe(pd.DataFrame({'问题': list(dict.fromkeys(errors))}), hide_index=True, width='stretch')
-        st.download_button('下载全部导入行审计 CSV', pd.DataFrame(importer.audit).to_csv(index=False).encode('utf-8-sig'),
-                           'import_audit.csv', 'text/csv', on_click='ignore')
-        st.download_button('下载文件导入记录 JSON', json.dumps(importer.import_attempts, ensure_ascii=False, indent=2),
-                           'import_attempts.json', 'application/json', on_click='ignore')
+def held_over_twelve_months(bought, sold):
+    # Exclude acquisition and disposal dates; a year is not always 365 days.
+    return sold.normalize() > bought.normalize() + pd.DateOffset(years=1)
 
-st.set_page_config(page_title='澳洲股票 CGT 计算', page_icon='🇦🇺', layout='wide')
-st.title('🇦🇺 澳洲跨券商股票 CGT 计算')
-st.markdown('按 FIFO 撮合买卖，以澳元计算指定财年的净资本利得。股息、利息、ETF 分配和个人全部收入需另外汇总。')
+# ==========================================
+# Streamlit 页面基础配置
+# ==========================================
+st.set_page_config(
+    page_title="澳洲 ATO 跨券商股票 CGT 报税清算系统",
+    page_icon="🇦🇺",
+    layout="wide"  # 响应式布局：PC端宽屏，移动端自动缩进
+)
 
-st.sidebar.header('⚙️ 报税参数')
-today = datetime.now(ZoneInfo('Australia/Sydney')).date()
-latest_completed = today.year - (1 if today.month >= 7 else 2)
-years = list(range(max(2000, latest_completed - 10), latest_completed + 1))
-fy = st.sidebar.selectbox('目标财年', years, index=len(years) - 1, format_func=lambda y: f'{y}-{y + 1}')
-opening_loss = st.sidebar.text_input('目标财年期初尚未使用资本亏损（AUD）', '0',
-                                    help='填写此前报税确认、截至本财年开始仍可结转的总余额。历史成交仅用于还原库存，不会再次计算历史亏损。')
-discount_mode = st.sidebar.selectbox('CGT 折扣资格', ['请选择', '符合条件的澳洲税务居民个人：50%', '不适用 CGT 折扣：0%'])
-st.sidebar.caption('50% 模型用于已核对政策的 2025-26 及以前财年；其他身份、特殊规则或后续财年需另行核对。')
+st.title("🇦🇺 澳洲 ATO 股票 CGT 联合清算系统")
+st.markdown("""
+本工具支持跨券商、跨历史时期的股票库存撮合。自动适用澳洲满一年的 **50% CGT 税收减免 (Individual Discount)**。
+""")
 
-st.sidebar.header('📁 券商交易报表')
-nab = st.sidebar.file_uploader('Nabtrade Excel', type=['xlsx', 'xls'])
-stake = st.sidebar.file_uploader('Stake Excel（可多选）', type=['xlsx', 'xls'], accept_multiple_files=True)
-fx = st.sidebar.file_uploader('外币逐日汇率 CSV（有外币交易时提供）', type=['csv'],
-                              help='列名：Date,Currency,AUD per unit；例如 2025-08-01,USD,1.55。需覆盖所有历史买入及卖出日期。')
-accounts = st.sidebar.file_uploader('账户受益权及报表账户映射 CSV（转仓核对）', type=['csv'],
-                                    help='Broker,Account,Owner ID,Evidence；原表无账户列时另填 File,Sheet。Owner ID 须代表完整受益权关系及比例。')
-transfer_reviews = st.sidebar.file_uploader('逐行转仓补充证据 CSV（可选）', type=['csv'],
-                                           help='先运行下载模板，再按记录标识补充方向/共同转仓编号及凭据。不能用勾选确认代替证据。')
-st.sidebar.caption('Stake Wall St 默认 USD；澳股默认 AUD。Nabtrade 国际交易只接受明确的 AUD 价格和手续费列。')
-confirmed = st.sidebar.checkbox('我已核对申报人并提供完整买卖历史及相关成本调整，国际交易如有均为美股；转仓受益权另按证据核对')
+# ==========================================
+# 侧边栏：参数配置与文件上传
+# ==========================================
+st.sidebar.header("⚙️ 第一步：配置报税参数")
 
-with st.expander('数据要求与计算范围'):
-    st.markdown('''
-    - 所有历史买入及卖出均需提供，包含目标财年前已卖出的交易；过往年度亏损余额单独填写。
-    - 空白手续费单元格按 0 处理；手续费列缺失会报错，请核对是否确实没有收费。
-    - FIFO 以成交日期匹配；同一股票同日有不同交易类型或不同买入成本时，需要核对日内顺序，系统会暂停计算。
-    - 国际交易目前只支持美国股票；股票按 AU / US 市场区分。代码变更、拆合股、合并及其他公司行动需要先调整并核对完整历史。
-    - 资本返还必须提供 `Capital Return Per Share (AUD)`（每股澳元金额），数量必须等于当天全部持仓；不会猜测原报表的金额单位。
-    - 没有卖出也不代表没有其他应申报收入或 CGT 事件。
-    - 转仓不按名称推定免税：需账户受益权证据、转入/转出配对和原始批次。未核对记录可能阻止计算，可展开查看及下载完整审计。
-    - 成本完整性仅能按已导入数据验证；ETF 年度 AMIT 等未在交易报表出现的调整仍需核对，本版本不自动处理这些调整。
-    ''')
-    st.markdown('[ATO：亏损抵扣顺序](https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax/calculating-your-cgt/using-capital-losses-to-reduce-capital-gains) · [ATO：CGT 折扣与持有期限](https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax/calculating-your-cgt/cgt-discount)')
+# 动态生成财年选项
+current_year = datetime.now().year
+fy_options = [f"{year}-{year+1}" for year in range(current_year - 5, current_year + 3)]
+# 默认选中 2025-2026 财年
+default_index = fy_options.index("2025-2026") if "2025-2026" in fy_options else 0
 
-if st.sidebar.button('🚀 合并并计算'):
-    if not nab and not stake:
-        st.error('请至少上传一份券商报表。')
-        st.stop()
-    if not confirmed or discount_mode == '请选择':
-        st.error('请确认历史数据及申报范围，并选择折扣资格；转仓所有权将另行核对。')
-        st.stop()
-    if fy > 2025:
-        st.error('当前计算规则尚未核对该财年政策，暂不输出该财年的金额。')
-        st.stop()
-    try:
-        importer = BrokerImporter(load_rates(fx), load_accounts(accounts), load_transfer_reviews(transfer_reviews))
-        with st.spinner('正在校验报表并匹配历史库存…'):
-            if nab:
-                importer.add_file(nab, 'Nabtrade')
-            for report in stake or []:
-                importer.add_file(report, 'Stake')
-            ledger = importer.reconcile(fy)
-            show_import_audit(importer, ledger)
-            errors = importer.errors + importer.ordering_errors() + ledger.errors
-            if errors or any(r['Blocks CGT'] for r in importer.transfer_audit):
-                st.error('数据校验未通过，暂不输出净资本利得。请展开核对明细/完整导入审计，补齐数据后重试。')
-                st.stop()
-            if not importer.transactions:
-                raise CalculationError('未解析到支持的交易记录。')
-            events = ledger.events
-            rate = Decimal('0.5') if '50%' in discount_mode else Decimal('0')
-            result = summarize(events, opening_loss, rate)
-        st.header(f'{fy}-{fy + 1} 财年股票 CGT 计算结果（AUD）')
-        st.caption(f'已校验并载入 {len(importer.transactions)} 条交易；完整历史用于 FIFO，当期范围为 {fy}-07-01 至 {fy + 1}-06-30。')
-        left, right = st.columns(2)
-        left.metric('计入收入的净资本利得', f"${result['taxable_gain']:,.2f}")
-        right.metric('期末可结转资本亏损', f"${result['carried_loss']:,.2f}")
-        st.write(f"折扣前资本盈利合计：${result['gross_gains']:,.2f}；当期资本亏损：${result['current_losses']:,.2f}。")
-        st.write(f"使用往年亏损：${result['opening_loss_used']:,.2f}；CGT 折扣金额：${result['discount']:,.2f}。")
-        st.caption('CGT 折扣金额是资本利得的扣减额，并非实际节省的税款。此结果仅涵盖已导入交易。')
-        with st.expander('期末持仓批次（含在途库存）'):
-            st.dataframe(pd.DataFrame(ledger.lots), hide_index=True, width='stretch')
-            st.download_button('下载期末批次与转仓检查 JSON',
-                               json.dumps({'lots': ledger.lots, 'transfers': ledger.transfer_checks}, ensure_ascii=False, indent=2),
-                               f'lot_audit_{fy}.json', 'application/json', on_click='ignore')
-        if not events:
-            st.info('已导入数据在本财年没有可计算的股票处置或资本返还利得；往年未用亏损余额继续保留。')
-        else:
-            records = []
-            for event in events:
-                record = asdict(event)
-                for field in ('quantity', 'gain'):
-                    record[field] = str(record[field])
-                records.append(record)
-            details = pd.DataFrame(records)
-            st.subheader('逐批次计算明细')
-            st.dataframe(details, hide_index=True, width='stretch')
-            st.download_button('下载逐批次 CSV', details.to_csv(index=False).encode('utf-8-sig'),
-                               file_name=f'cgt_{fy}_{fy + 1}.csv', mime='text/csv', on_click='ignore')
-    except (CalculationError, ValueError) as exc:
-        st.error(f'无法完成计算：{exc}')
+TARGET_FY = st.sidebar.selectbox("选择目标申报财年 (Financial Year)", fy_options, index=default_index)
+
+# 解析目标财年的时间范围
+start_year = int(TARGET_FY.split("-")[0])
+fy_start = pd.to_datetime(f"{start_year}-07-01")
+fy_end = pd.to_datetime(f"{start_year + 1}-06-30")
+fy_exclusive_end = pd.to_datetime(f"{start_year + 1}-07-01")
+
+st.sidebar.markdown("---")
+st.sidebar.header("📁 第二步：上传券商原始 Excel")
+
+# 1. 上传 Nabtrade 报告
+nabtrade_file = st.sidebar.file_uploader(
+    "上传原券商报告 (Nabtrade)",
+    type=["xlsx", "xls"],
+    help="请上传包含 'Domestic Portfolio Transactions' 或 'Int. Portfolio Transactions' 工作表的完整 Excel 报告。"
+)
+
+# 2. 上传多个 Stake 报告
+stake_files = st.sidebar.file_uploader(
+    "上传 Stake 报告 (支持多选)",
+    type=["xlsx", "xls"],
+    accept_multiple_files=True,
+    help="您可以同时选择并上传多个不同财年或不同时段导出的 Stake Excel 报告。"
+)
+
+# 用来存放全局流水的列表和安全去重集合
+all_transactions = []
+seen_stake_identifiers = set()
+transfer_records = []
+unresolved = []
+uncertain_assets = set()
+parse_errors = []
+transfer_types = {'TRANSFER', 'TRANSFER IN', 'TRANSFER OUT', 'STOCK TRANSFER',
+                  'STOCK TRANSFER IN', 'STOCK TRANSFER OUT', 'INWARD TRANSFER',
+                  'OUTWARD TRANSFER', 'BROKER TRANSFER IN', 'BROKER TRANSFER OUT',
+                  'SECURITY TRANSFER', 'SECURITY TRANSFER IN', 'SECURITY TRANSFER OUT',
+                  'OFF MARKET TRANSFER'}
+same_owner = st.sidebar.checkbox('如有普通券商转仓，我确认受益所有人未改变', value=False,
+                                 help='不需额外 CSV。未确认也可以计算，但含转仓的结果只作待核对小计。所有权变化不能按普通转仓处理。')
+opening_loss = st.sidebar.number_input('往年尚未使用的资本亏损（AUD，可选）', min_value=0.0, value=0.0,
+                                       help='填写本财年期初可用余额；默认 0，不要求补充文件。')
+
+
+def record_transfer(row, action, source, row_number, ticker, date_column, quantity_column, market='AU'):
+    """Retain source rows; do not create acquisitions or estimate missing cost."""
+    transfer_records.append({'来源': source, 'Excel 行号': row_number,
+                             '代码': ticker, '日期': str(row.get(date_column, '')),
+                             '数量': row.get(quantity_column, ''), '原始类型': action,
+                             '受益所有权': '用户确认未改变' if same_owner else '未验证',
+                             '处理': '仅在所有权未变的前提下，不改变全局历史持仓'})
+    changed = str(row.get('Beneficial Ownership Changed', '')).strip().upper() == 'YES'
+    from_owner = str(row.get('From Owner ID', '')).strip()
+    to_owner = str(row.get('To Owner ID', '')).strip()
+    if pd.isna(row.get('From Owner ID', np.nan)):
+        from_owner = ''
+    if pd.isna(row.get('To Owner ID', np.nan)):
+        to_owner = ''
+    if changed or (from_owner and to_owner and from_owner != to_owner):
+        uncertain_assets.add((market, ticker))
+        unresolved.append(f'{source} 第 {row_number} 行 {ticker}: 明确存在受益所有权变化，不能按普通券商转仓处理')
+        transfer_records[-1]['受益所有权'] = '原始记录显示已改变'
+        return
+    transfer_quantity = pd.to_numeric(row.get(quantity_column), errors='coerce')
+    if pd.isna(transfer_quantity) or not np.isfinite(transfer_quantity) or transfer_quantity == 0:
+        transfer_records[-1]['处理'] += '；原表未提供有效转仓数量，未据此改变历史库存'
+        return
+    all_transactions.append({'Date': pd.to_datetime(row[date_column]).tz_localize(None),
+                             'Ticker': ticker, 'Market': market, 'Type': 'TRANSFER_CHECK',
+                             'Quantity': float(abs(transfer_quantity)), 'Price': 0.0,
+                             'Fees': 0.0, 'Source': source})
+
+
+def show_calculation_notes():
+    notes = list(dict.fromkeys(parse_errors + unresolved))
+    if notes:
+        st.warning(f'有 {len(notes)} 项记录需要核对；下面继续展示有完整成本记录的交易小计，不是最终报税金额。')
+        for note in notes[:3]:
+            st.write(note)
+        if len(notes) > 3:
+            with st.expander('查看其余待核对记录'):
+                st.dataframe(pd.DataFrame({'需核对事项': notes[3:]}), hide_index=True, width='stretch')
+
+# 开始处理按钮
+run_analysis = st.sidebar.button("🚀 开始融合账目并计算")
+
+# ==========================================
+# 核心数据处理逻辑
+# ==========================================
+if run_analysis:
+    if not nabtrade_file and not stake_files:
+        st.error("❌ 请至少上传一个 Nabtrade 或 Stake 的 Excel 文件后再点击运行。")
+    else:
+        # 实时处理日志在手机端单行展示
+        st.info("🚀 开始进行跨多券商、多历史期持仓联合 CGT 结算分析...")
+        st.caption(f"📅 目标财年: {TARGET_FY} ({fy_start.strftime('%Y-%m-%d')} 至 {fy_end.strftime('%Y-%m-%d')})")
+
+        with st.spinner("正在解析数据并进行跨平台 FIFO 库存撮合，请稍候..."):
+
+            # --- 1. 解析 Nabtrade 文件 ---
+            if nabtrade_file is not None:
+                # 国内交易
+                try:
+                    df_dom = pd.read_excel(nabtrade_file, sheet_name='Domestic Portfolio Transactions', skiprows=1)
+                    df_dom = df_dom.dropna(subset=['Date', 'Code', 'Movement Type'])
+                    for row_index, row in df_dom.iterrows():
+                        tx_type = str(row['Movement Type']).upper().strip()
+                        ticker = str(row['Code']).split('.')[0].strip().upper()
+                        if tx_type in transfer_types:
+                            record_transfer(row, tx_type, 'Nabtrade/Domestic Portfolio Transactions', row_index + 3, ticker, 'Date', 'Quantity')
+                            continue
+                        if 'TRANSFER' in tx_type:
+                            uncertain_assets.add(('AU', ticker))
+                            unresolved.append(f'Nabtrade 第 {row_index + 3} 行 {ticker}: {tx_type} 不能确定为普通转仓')
+                            continue
+                        all_transactions.append({
+                            'Date': pd.to_datetime(row['Date']).tz_localize(None),
+                            'Ticker': ticker,
+                            'Market': 'AU',
+                            'Type': tx_type,
+                            'Quantity': float(abs(row['Quantity'])),
+                            'Price': float(row['Transaction Price']),
+                            'Fees': fee_value(row, 'Brokerage') + fee_value(row, 'Other Fees'),
+                            'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
+                            'Source': 'Nabtrade_Domestic'
+                        })
+                    st.success(f"✅ 成功载入原券商国内交易记录: {len(df_dom)} 条")
+                except Exception as e:
+                    if 'Worksheet named' not in str(e):
+                        parse_errors.append(f'Nabtrade 国内工作表：{e}')
+
+                # 国际交易
+                try:
+                    int_sheet = next((name for name in pd.ExcelFile(nabtrade_file).sheet_names
+                                      if ' '.join(name.split()) == 'Int. Portfolio Transactions'), None)
+                    if int_sheet is None:
+                        raise ValueError('Worksheet named international not found')
+                    df_int = pd.read_excel(nabtrade_file, sheet_name=int_sheet, skiprows=1)
+                    df_int = df_int.dropna(subset=['Date', 'Code', 'Movement Type'])
+                    for row_index, row in df_int.iterrows():
+                        tx_type = str(row['Movement Type']).upper().strip()
+                        ticker = str(row['Code']).strip().upper()
+                        if tx_type in transfer_types:
+                            record_transfer(row, tx_type, f'Nabtrade/{int_sheet}', row_index + 3, ticker, 'Date', 'Quantity', market='US')
+                            continue
+                        if 'TRANSFER' in tx_type:
+                            uncertain_assets.add(('US', ticker))
+                            unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 无法确认转仓类型')
+                            continue
+                        if tx_type in ['BUY', 'B', 'SELL', 'S'] and pd.isna(row.get('Average Price (AUD) *1', np.nan)):
+                            uncertain_assets.add(('US', ticker))
+                            unresolved.append(f'Nabtrade 国际第 {row_index + 3} 行 {ticker}: 缺少 AUD 单价，未把外币当作澳元')
+                            continue
+                        all_transactions.append({
+                            'Date': pd.to_datetime(row['Date']).tz_localize(None),
+                            'Ticker': ticker,
+                            'Market': 'US',
+                            'Type': tx_type,
+                            'Quantity': float(abs(row['Quantity'])),
+                            'Price': float(row.get('Average Price (AUD) *1', 0)),
+                            'Fees': fee_value(row, 'Brokerage (AUD)') + fee_value(row, 'Other Fees (AUD)'),
+                            'ROC Per Share': row.get('Capital Return Per Share (AUD)', np.nan),
+                            'Source': 'Nabtrade_International'
+                        })
+                    st.success(f"✅ 成功载入原券商国际交易记录: {len(df_int)} 条")
+                except Exception as e:
+                    if 'Worksheet named' not in str(e):
+                        parse_errors.append(f'Nabtrade 国际工作表：{e}')
+
+            # --- 2. 解析多个 Stake 文件 ---
+            if stake_files:
+                stake_sheets = ['Aus Equities', 'Wall St Equities']
+                for f_file in stake_files:
+                    st.caption(f"🔍 发现符合条件的 Stake 文件: {f_file.name}")
+                    for sheet in stake_sheets:
+                        try:
+                            df_stake = pd.read_excel(f_file, sheet_name=sheet)
+                            if df_stake.empty:
+                                continue
+
+                            df_stake.columns = df_stake.columns.str.strip()
+                            df_stake = df_stake.dropna(subset=['Trade Date', 'Symbol', 'Side'])
+
+                            s_count = 0
+                            d_skipped = 0
+                            occurrences = {}
+                            for row_index, row in df_stake.iterrows():
+                                tx_type = str(row['Side']).upper().strip()
+                                ticker = str(row['Symbol']).strip().upper()
+                                market = 'AU' if sheet == 'Aus Equities' else 'US'
+                                if market == 'AU':
+                                    ticker = ticker.removesuffix('.AX')
+                                if tx_type in transfer_types:
+                                    record_transfer(row, tx_type, f'{f_file.name}/{sheet}', row_index + 2, ticker, 'Trade Date', 'Units', market=market)
+                                    continue
+                                if 'TRANSFER' in tx_type:
+                                    uncertain_assets.add((market, ticker))
+                                    unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 无法确认转仓类型')
+                                    continue
+                                if tx_type not in ['BUY', 'SELL', 'B', 'S']:
+                                    continue
+
+                                price = row['Avg. Price']
+                                fees = fee_value(row, 'Fees') + fee_value(row, 'GST')
+                                if market == 'US' and str(row.get('Currency', '')).strip().upper() != 'AUD':
+                                    price = row.get('Avg. Price (AUD)', np.nan)
+                                    if pd.isna(price) or (fees and pd.isna(row.get('Fees (AUD)', np.nan))):
+                                        uncertain_assets.add((market, ticker))
+                                        unresolved.append(f'{f_file.name}/{sheet} 第 {row_index + 2} 行 {ticker}: 缺少明确 AUD 价格/费用，未混算币种')
+                                        continue
+                                    fees = fee_value(row, 'Fees (AUD)') + fee_value(row, 'GST (AUD)')
+
+                                # 精准安全去重标识
+                                raw_id = row.get('Trade Identifier', '')
+                                trade_id = '' if pd.isna(raw_id) else str(raw_id).strip()
+                                canonical_side = {'B': 'BUY', 'S': 'SELL'}.get(tx_type, tx_type)
+                                if not trade_id:
+                                    fingerprint = (str(pd.to_datetime(row['Trade Date'])), ticker, canonical_side,
+                                                   float(abs(row['Units'])), float(price), float(fees))
+                                    occurrences[fingerprint] = occurrences.get(fingerprint, 0) + 1
+                                    trade_id = ('no-id', fingerprint, occurrences[fingerprint])
+                                else:
+                                    trade_id = ('id', trade_id)
+                                trade_id = (sheet, str(row.get('Account Number', '')), trade_id)
+
+                                if trade_id in seen_stake_identifiers:
+                                    d_skipped += 1
+                                    continue
+
+                                seen_stake_identifiers.add(trade_id)
+
+                                all_transactions.append({
+                                    'Date': pd.to_datetime(row['Trade Date']).tz_localize(None),
+                                    'Ticker': ticker,
+                                    'Market': market,
+                                    'Type': tx_type,
+                                    'Quantity': float(abs(row['Units'])),
+                                    'Price': float(price),
+                                    'Fees': float(fees),
+                                    'Source': f'Stake_{sheet.split()[0]}'
+                                })
+                                s_count += 1
+                            if s_count > 0:
+                                st.success(f"✅ 来自 [{f_file.name}] 的 [{sheet}]: 成功载入新记录 {s_count} 条")
+                        except Exception as e:
+                            if 'Worksheet named' not in str(e):
+                                parse_errors.append(f'{f_file.name}/{sheet}：{e}')
+
+            if transfer_records:
+                message = f'检测到 {len(transfer_records)} 条普通转仓记录：不作为新买卖、不重置历史购入日期或成本。'
+                if same_owner:
+                    st.info(message + '受益所有权未变由用户确认；未进行自动身份验证。')
+                else:
+                    st.warning(message + '受益所有权尚未核实，下面的金额仅供核对。')
+                with st.expander('查看转仓记录'):
+                    st.dataframe(pd.DataFrame(transfer_records), hide_index=True, width='stretch')
+
+            # --- 3. 运行 FIFO 清算引擎（保持原版全局历史匹配） ---
+            if not all_transactions:
+                show_calculation_notes()
+                st.error("❌ 未能在您上传的所有 Excel 中解析到合规的 BUY/SELL 交易。")
+            else:
+                df_all = pd.DataFrame(all_transactions)
+                df_all = df_all.sort_values('Date', kind='stable').reset_index(drop=True)
+
+                type_map = {'BUY': 'BUY', 'B': 'BUY', 'SELL': 'SELL', 'S': 'SELL', 'RETURN OF CAPITAL': 'RETURN_OF_CAPITAL', 'ROC': 'RETURN_OF_CAPITAL'}
+                df_all['Type'] = df_all['Type'].map(type_map).fillna(df_all['Type'])
+
+                portfolio = {}
+                cgt_events = []
+
+                for idx, row in df_all.iterrows():
+                    ticker = row['Ticker']
+                    action = row['Type']
+                    date = row['Date']
+                    qty = row['Quantity']
+                    price = row['Price']
+                    fees = row['Fees']
+                    source = row['Source']
+
+                    asset = (row['Market'], ticker)
+                    if date >= fy_exclusive_end:
+                        continue
+                    if action in ('DIVIDEND', 'INTEREST', 'CASH', 'DEPOSIT', 'WITHDRAWAL'):
+                        continue
+                    if action not in ('BUY', 'SELL', 'RETURN_OF_CAPITAL', 'TRANSFER_CHECK'):
+                        uncertain_assets.add(asset)
+                        unresolved.append(f'{source} {ticker} {date.date()}: {action} 需核对是否涉及公司行动或成本调整')
+                        continue
+                    if (not all(np.isfinite(value) for value in (qty, price, fees)) or qty <= 0 or price < 0):
+                        uncertain_assets.add(asset)
+                        unresolved.append(f'{source} {ticker} {date}: 数量、价格或费用无效')
+                        continue
+                    if asset not in portfolio:
+                        portfolio[asset] = []
+
+                    if action == 'TRANSFER_CHECK':
+                        holding = sum(lot['qty'] for lot in portfolio[asset])
+                        if qty > holding + 1e-9:
+                            uncertain_assets.add(asset)
+                            unresolved.append(f'{source} {ticker} {date.date()}: 转仓数量 {qty:g} 超过已知历史持仓 {holding:g}，需核对原始买入')
+                        continue
+
+                    if action == 'RETURN_OF_CAPITAL':
+                        total_holding = sum([lot['qty'] for lot in portfolio[asset]])
+                        reduction_per_share = row.get('ROC Per Share', np.nan)
+                        if pd.isna(reduction_per_share) or not np.isfinite(float(reduction_per_share)) or float(reduction_per_share) < 0:
+                            uncertain_assets.add(asset)
+                            unresolved.append(f'{source} {ticker} {date.date()}: 资本返还缺少明确的每股 AUD 金额，未猜测成本调整')
+                            continue
+                        reduction_per_share = float(reduction_per_share)
+                        if total_holding > 0:
+                            for lot in portfolio[asset]:
+                                original_cost = lot['price'] + lot['fees'] / lot['qty']
+                                excess = max(0.0, reduction_per_share - original_cost)
+                                if excess > 0 and fy_start <= date < fy_exclusive_end:
+                                    cgt_events.append({'Ticker': ticker, 'Market': asset[0],
+                                                       'Buy Date': lot['date'].strftime('%Y-%m-%d'),
+                                                       'Sell Date': date.strftime('%Y-%m-%d'), 'Quantity': lot['qty'],
+                                                       'Category': 'Held >= 1 Year (Discountable)' if held_over_twelve_months(lot['date'], date) else 'Held < 1 Year (No Discount)',
+                                                       'Net Gain/Loss': excess * lot['qty'], 'Buy Platform': lot['source'], 'Sell Platform': source})
+                                lot['price'] = max(0.0, original_cost - reduction_per_share)
+                                lot['fees'] = 0.0
+                        else:
+                            uncertain_assets.add(asset)
+                            unresolved.append(f'{source} {ticker} {date.date()}: 资本返还缺少历史持仓')
+                        continue
+
+                    if action == 'BUY':
+                        portfolio[asset].append({
+                            'date': date, 'qty': qty, 'price': price, 'fees': fees, 'source': source
+                        })
+                    elif action == 'SELL':
+                        qty_to_sell = qty
+                        quantity_tolerance = np.finfo(float).eps * max(1.0, qty) * 16
+                        sell_fee_share = fees / qty_to_sell if qty_to_sell > 0 else 0
+
+                        while qty_to_sell > quantity_tolerance:
+                            if not portfolio[asset]:
+                                uncertain_assets.add(asset)
+                                unresolved.append(f'{source} {ticker} {date.date()}: {qty_to_sell:g} 股卖出缺少原始买入成本，未按零盈利处理')
+                                break
+
+                            first_lot = portfolio[asset][0]
+                            buy_date = first_lot['date']
+                            is_discounted = held_over_twelve_months(buy_date, date)
+
+                            matched_qty = min(qty_to_sell, first_lot['qty'])
+                            buy_fee_share = first_lot['fees'] / first_lot['qty'] if first_lot['qty'] > 0 else 0
+                            cost_base_per_share = first_lot['price'] + buy_fee_share
+                            proceeds_per_share = price - sell_fee_share
+                            total_gain_lot = (proceeds_per_share - cost_base_per_share) * matched_qty
+
+                            if fy_start <= date < fy_exclusive_end:
+                                cgt_events.append({
+                                    'Ticker': ticker,
+                                    'Market': asset[0],
+                                    'Buy Date': buy_date.strftime('%Y-%m-%d'),
+                                    'Sell Date': date.strftime('%Y-%m-%d'),
+                                    'Quantity': matched_qty,
+                                    'Category': 'Held >= 1 Year (Discountable)' if is_discounted else 'Held < 1 Year (No Discount)',
+                                    'Net Gain/Loss': total_gain_lot,
+                                    'Buy Platform': first_lot['source'],
+                                    'Sell Platform': source
+                                })
+
+                            qty_to_sell -= matched_qty
+                            first_lot['fees'] = max(0.0, first_lot['fees'] - buy_fee_share * matched_qty)
+                            first_lot['qty'] -= matched_qty
+                            if first_lot['qty'] <= quantity_tolerance:
+                                portfolio[asset].pop(0)
+
+                # Missing cost invalidates this security's result, not all other
+                # securities. Never label the remaining subtotal a complete return.
+                cgt_events = [event for event in cgt_events
+                              if (event['Market'], event['Ticker']) not in uncertain_assets]
+                if start_year > 2025:
+                    unresolved.append('当前使用原版个人 50% 折扣模型；2026-27 及以后财年政策未验证，金额仅供核对')
+                show_calculation_notes()
+                is_complete = not (parse_errors or unresolved or (transfer_records and not same_owner))
+
+                # ==========================================
+                # 📢 移动端完美适配的 UI 渲染设计
+                # ==========================================
+                st.markdown("---")
+                st.header(f"🇦🇺 澳洲 ATO {TARGET_FY} 财年 CGT 申报清算单")
+                st.caption("✨ 跨财年多文件融合版 · 全局全历史采购关联")
+
+                if not cgt_events:
+                    st.info('该财年没有可计算的已知处置记录。' if not is_complete else '该财年未检测到卖出或资本返还利得；其他收入和 CGT 事件仍需另外核对。')
+                    if is_complete and opening_loss:
+                        st.metric('往年资本亏损继续结转', f'${opening_loss:,.2f}')
+                else:
+                    cgt_df = pd.DataFrame(cgt_events)
+
+                    # 1. 严格拆分提取原始（Gross）长、短期独立盈亏项
+                    lt_mask = cgt_df['Category'].str.contains('Held >= 1 Year')
+                    st_mask = cgt_df['Category'].str.contains('Held < 1 Year')
+
+                    lt_gains = cgt_df[lt_mask & (cgt_df['Net Gain/Loss'] > 0)]['Net Gain/Loss'].sum()
+                    lt_losses = abs(cgt_df[lt_mask & (cgt_df['Net Gain/Loss'] < 0)]['Net Gain/Loss'].sum())
+
+                    st_gains = cgt_df[st_mask & (cgt_df['Net Gain/Loss'] > 0)]['Net Gain/Loss'].sum()
+                    st_losses = abs(cgt_df[st_mask & (cgt_df['Net Gain/Loss'] < 0)]['Net Gain/Loss'].sum())
+
+                    # 汇总展示数据指标用
+                    short_term_total = st_gains - st_losses
+                    long_term_total = lt_gains - lt_losses
+                    all_gains = lt_gains + st_gains
+                    all_losses = lt_losses + st_losses
+                    raw_net_result = all_gains - all_losses
+
+                    # ----------------------------------------------------
+                    # ATO 官方标准核心算法对冲状态机（修正亏损抵扣顺序错误）
+                    # ----------------------------------------------------
+                    total_losses_to_offset = all_losses + opening_loss
+
+                    # 先抵扣不享受折扣的盈利，再抵扣可折扣盈利。
+                    short_offset = min(st_gains, total_losses_to_offset)
+                    net_st_gain = st_gains - short_offset
+                    total_losses_to_offset -= short_offset
+                    long_offset = min(lt_gains, total_losses_to_offset)
+                    net_lt_gain = lt_gains - long_offset
+                    total_losses_to_offset -= long_offset
+                    taxable_gain = net_st_gain + net_lt_gain * 0.5
+                    carried_loss = max(0.0, total_losses_to_offset)
+
+                    # ----------------------------------------------------
+                    # 【核心模块一】：ATO 最终报税申报结论 & 最终计入总收入统计
+                    # ----------------------------------------------------
+                    st.subheader('📢 ATO 股票 CGT 计算结果' if is_complete else '📢 已知交易小计（待核对，非最终报税金额）')
+                    if taxable_gain > 0:
+                        st.success(f"""
+                        **1. {'计入收入的净资本利得' if is_complete else '已知交易按当前假设计算的净资本利得小计（非最终报税金额）'}：**
+                        ## **${taxable_gain:,.2f}**
+
+                        **2. 减免明细预览（50% Individual Discount 节省额）：**
+                        * 当期折扣前净收益（未扣往年亏损）: `${raw_net_result:,.2f}`
+                        * 剩余长期盈利的 50% CGT 折扣金额（不是节省的税款）: `${(net_lt_gain * 0.5):,.2f}`
+
+                        *💡 该系统已帮您自动应用折减。上述高亮的倍数金额将作为【应纳税所得（Assessable Income）】直接并入您当期的个人综合总收入（包含工资、利息、海外收入等），并最终按您的年度个人边际税率（Marginal Tax Rate）计税。*
+                        """)
+                    else:
+                        st.error(f"""
+                        **1. {'计入收入的净资本利得' if is_complete else '已知交易净资本利得小计（非最终报税金额）'}：** ## **$0.00**
+                        **2. {'可结转的资本亏损' if is_complete else '已知交易计算的亏损余额（待核对）'}：** ## **${carried_loss:,.2f}**
+
+                        *💡 注：在澳洲，股票净亏损不能用来抵扣当年的打工工资收入（Salary/Wages），只能锁死在税务账户中，永久结转用于抵扣未来年份的股票或房产等资本增值盈利。*
+                        """)
+
+                    # ----------------------------------------------------
+                    # 【核心模块二】：整体原始资本账目汇总（手机端自动向下排列）
+                    # ----------------------------------------------------
+                    st.subheader("📊 整体原始资本账目汇总 (Gross)")
+
+                    # 利用 st.columns 实现移动端自动流式堆叠（PC端并排，手机端自动变单行纵向列表）
+                    m_col1, m_col2 = st.columns(2)
+                    m_col1.metric("当期短期持有(未满一年)变现", f"${short_term_total:,.2f}")
+                    m_col2.metric("当期长期持有(满一年以上)变现", f"${long_term_total:,.2f}")
+
+                    m_col3, m_col4 = st.columns(2)
+                    m_col3.metric("本财年纯盈利项加总", f"${all_gains:,.2f}")
+                    m_col4.metric("本财年纯亏损项加总", f"-${all_losses:,.2f}")
+
+                    # ----------------------------------------------------
+                    # 【核心模块三】：各资产独立结算明细（卡片流布局，免除横向滚动）
+                    # ----------------------------------------------------
+                    st.subheader("📋 各资产独立结算明细")
+                    st.download_button('下载已知交易逐批次明细 CSV', cgt_df.to_csv(index=False).encode('utf-8-sig'),
+                                       file_name=f'cgt_{TARGET_FY}.csv', mime='text/csv', on_click='ignore')
+
+                    asset_summary = cgt_df.groupby(['Market', 'Ticker', 'Category'])['Net Gain/Loss'].sum().reset_index()
+
+                    for _, row in asset_summary.iterrows():
+                        ticker = f"{row['Market']}:{row['Ticker']}"
+                        cat = row['Category']
+                        gain_loss = row['Net Gain/Loss']
+
+                        # 根据盈亏赋予不同的视觉前缀和颜色
+                        if gain_loss >= 0:
+                            status_badge = "🟢 净盈利"
+                            bg_color = "rgba(40, 167, 69, 0.1)"
+                        else:
+                            status_badge = "🔴 净亏损"
+                            bg_color = "rgba(220, 53, 69, 0.1)"
+
+                        # 移动端友好型卡片：用 Markdown 容器模拟，文字自动换行适配屏幕宽度
+                        st.markdown(
+                            f"""
+                            <div style="
+                                padding: 12px;
+                                border-radius: 8px;
+                                background-color: {bg_color};
+                                margin-bottom: 8px;
+                                border-left: 5px solid {'#28a745' if gain_loss >= 0 else '#dc3545'};
+                            ">
+                                <b style="font-size:16px;">资产代码: {ticker}</b><br/>
+                                <span style="font-size:13px; color:#6c757d;">持有类型: {cat}</span><br/>
+                                <span style="font-size:14px; font-weight:bold;">{status_badge}: ${abs(gain_loss):,.2f}</span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
 else:
-    st.info('请在侧栏选择财年、填写参数并上传交易报表。')
+    st.info("💡 请在左侧侧边栏上传相应的 Nabtrade/Stake 表格，并点击 [开始融合账目并计算] 按钮。")

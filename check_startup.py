@@ -17,19 +17,13 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
-REQUIRED_DISTRIBUTIONS = {'streamlit', 'pandas', 'openpyxl', 'xlrd', 'tzdata', 'websockets'}
-CRITICAL_IMPORTS = {
-    'stock_tax.cgt': ('CalculationError', 'Transaction', 'Transfer', 'calculate_ledger', 'summarize'),
-    'stock_tax.importers': ('BrokerImporter', 'load_rates', 'load_accounts', 'load_transfer_reviews',
-                            'CONFIRMED', 'REVIEW', 'BLOCKED', 'INVALID'),
-}
+REQUIRED_DISTRIBUTIONS = {'streamlit', 'pandas', 'numpy', 'openpyxl', 'xlrd', 'tzdata', 'websockets'}
 
 
 def check_imports(root=ROOT):
-    """Validate the tracked internal API, dependency manifest and import graph."""
-    manifest = root / 'requirements.txt'
+    """Check the original single-file app and its actual declared dependencies."""
     entries = {re.split(r'[<>=!~\[;\s]', line.strip(), maxsplit=1)[0].lower()
-               for line in manifest.read_text(encoding='utf-8-sig').splitlines()
+               for line in (root / 'requirements.txt').read_text(encoding='utf-8-sig').splitlines()
                if line.strip() and not line.lstrip().startswith('#')}
     missing = REQUIRED_DISTRIBUTIONS - entries
     if missing:
@@ -37,44 +31,17 @@ def check_imports(root=ROOT):
     versions = {name: metadata.version(name) for name in sorted(REQUIRED_DISTRIBUTIONS)}
     for name in sorted(REQUIRED_DISTRIBUTIONS):
         importlib.import_module(name)
-    graph = {}
-    for path in (root / 'stock_tax').glob('*.py'):
-        name = 'stock_tax' if path.stem == '__init__' else f'stock_tax.{path.stem}'
-        graph[name] = []
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8-sig'))):
-            if isinstance(node, ast.ImportFrom):
-                dependency = f'stock_tax.{node.module}' if node.level else node.module
-                if dependency and dependency.startswith('stock_tax.'):
-                    graph[name].append(dependency)
-    visited = set()
-
-    def visit(name, chain):
-        if name in chain:
-            raise RuntimeError(f'Circular internal import: {" -> ".join(chain + [name])}')
-        if name not in graph:
-            raise RuntimeError(f'Missing internal module: {name}')
-        if name not in visited:
-            for dependency in graph[name]:
-                visit(dependency, chain + [name])
-            visited.add(name)
-
-    for name in graph:
-        visit(name, [])
-    imports = {name: set(symbols) for name, symbols in CRITICAL_IMPORTS.items()}
     for node in ast.walk(ast.parse((root / 'app.py').read_text(encoding='utf-8-sig'))):
         if isinstance(node, ast.ImportFrom) and node.module:
-            if node.module in ('cgt', 'importers'):
-                raise RuntimeError(f'app.py uses a generic internal module: {node.module}')
-            if node.module.startswith('stock_tax.'):
-                imports.setdefault(node.module, set()).update(alias.name for alias in node.names)
-    for name, symbols in imports.items():
-        module = importlib.import_module(name)
-        expected = root / (name.replace('.', '/') + '.py')
-        if Path(module.__file__).resolve() != expected.resolve():
-            raise RuntimeError(f'Wrong module resolved: {name}: {module.__file__}')
-        for symbol in symbols:
-            if not hasattr(module, symbol):
-                raise RuntimeError(f'Missing internal symbol: {name}.{symbol}')
+            module = importlib.import_module(node.module)
+            for alias in node.names:
+                if not hasattr(module, alias.name):
+                    raise RuntimeError(f'Missing imported symbol: {node.module}.{alias.name}')
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ('cgt', 'importers') or alias.name.startswith('stock_tax'):
+                    raise RuntimeError('app.py must remain independent of the replaced business modules')
+                importlib.import_module(alias.name)
     return versions
 
 
@@ -140,9 +107,9 @@ def check_server(root=ROOT, timeout=45):
                         break
                 else:
                     raise RuntimeError('Streamlit session initialization timed out')
-            if elements.count('file_uploader') != 5 or elements.count('selectbox') != 2:
+            if elements.count('file_uploader') != 2 or elements.count('selectbox') != 1:
                 raise RuntimeError(f'Missing sidebar inputs: {elements}')
-            if not any('CGT' in heading for heading in headings) or '🚀 合并并计算' not in labels:
+            if not any('CGT' in heading for heading in headings) or '🚀 开始融合账目并计算' not in labels:
                 raise RuntimeError('Missing application title or calculation button')
             return {name: elements.count(name) for name in sorted(set(elements))}
         except Exception as exc:
